@@ -11,6 +11,7 @@ from typing import Any
 
 
 def _json_dumps(value: Any) -> str:
+    # date/datetime из фронтматтера скиллов не сериализуются напрямую — пишем ISO-строкой
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
