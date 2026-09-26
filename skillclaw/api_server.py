@@ -1407,6 +1407,63 @@ def _openai_to_anthropic_response(
 # ------------------------------------------------------------------ #
 
 
+def _message_tool_call_ids(message: dict) -> set[str]:
+    """Collect the tool_call ids a message references (issued or answered)."""
+    ids: set[str] = set()
+
+    if not isinstance(message, dict):
+        return ids
+
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for call in tool_calls:
+            if isinstance(call, dict) and call.get("id"):
+                ids.add(str(call["id"]))
+
+    if message.get("role") == "tool":
+        call_id = message.get("tool_call_id")
+        if call_id:
+            ids.add(str(call_id))
+
+    return ids
+
+
+def _message_drop_units(messages: list[dict]) -> list[list[int]]:
+    """Group message indices into units that must be dropped together.
+
+    An assistant tool-call message and the role:tool results answering it are
+    one unit: keeping a result without the turn that issued its ``tool_call_id``
+    produces an orphan tool message, which OpenAI-compatible upstreams reject
+    with ``400 invalid_request_error``. Every other message is its own unit.
+    """
+    units: list[list[int]] = []
+    index = 0
+    while index < len(messages):
+        message = messages[index]
+        if not isinstance(message, dict) or not _message_tool_call_ids(message):
+            units.append([index])
+            index += 1
+            continue
+
+        group = [index]
+        group_ids = set(_message_tool_call_ids(message))
+        index += 1
+        while index < len(messages) and _message_tool_call_ids(messages[index]) & group_ids:
+            group_ids |= _message_tool_call_ids(messages[index])
+            group.append(index)
+            index += 1
+        units.append(group)
+    return units
+
+
+def _drop_oldest_units(messages: list[dict], units: list[list[int]], count: int) -> list[dict]:
+    """Drop the ``count`` oldest units, keeping the rest in order."""
+    dropped: set[int] = set()
+    for unit in units[:count]:
+        dropped.update(unit)
+    return [m for i, m in enumerate(messages) if i not in dropped]
+
+
 class SkillClawAPIServer:
     """Proxy between client agents and the upstream model with SkillClaw hooks.
 
@@ -3200,14 +3257,24 @@ class SkillClawAPIServer:
         sys_msgs = [m for m in messages if m.get("role") == "system"]
         non_sys = [m for m in messages if m.get("role") != "system"]
 
+        # A role:tool message is only valid when the assistant turn that issued
+        # its tool_call_id is still present. Dropping messages one at a time can
+        # strip that assistant turn and orphan the result, which OpenAI-compatible
+        # upstreams reject with 400 invalid_request_error. Drop whole tool groups.
+        units = _message_drop_units(non_sys)
+
+        # Walk oldest-unit-first and stop as soon as the remainder fits. The
+        # newest unit is always kept so the conversation has a live turn.
         dropped = 0
-        while len(non_sys) - dropped > 1:
-            dropped += 1
-            candidate = sys_msgs + non_sys[dropped:]
-            if _prompt_len(candidate) <= max_prompt_tokens:
+        for step in range(1, len(units)):
+            candidate = _drop_oldest_units(non_sys, units, step)
+            if not candidate:
+                break
+            dropped = step
+            if _prompt_len(sys_msgs + candidate) <= max_prompt_tokens:
                 break
 
-        result = sys_msgs + non_sys[dropped:]
+        result = sys_msgs + _drop_oldest_units(non_sys, units, dropped)
         result_tokens = _prompt_len(result)
         if dropped:
             logger.info(
