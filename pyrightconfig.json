@@ -1,0 +1,19 @@
+{
+  "include": ["skillclaw", "evolve_server", "tests", "scripts"],
+  "exclude": [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.venv",
+    "**/venv",
+    "**/*.egg-info",
+    "skillclaw.egg-info"
+  ],
+  "extraPaths": ["."],
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "none",
+  "useLibraryCodeForTypes": true,
+  "pythonVersion": "3.10",
+  "venvPath": ".",
+  "venv": ".venv"
+}
