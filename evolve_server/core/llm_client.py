@@ -16,6 +16,33 @@ def _normalize_temperature(model: str, requested: float) -> float:
     return requested
 
 
+def _is_unsupported_temperature_error(body_text: str) -> bool:
+    """True when a 400 says the model or route rejects the ``temperature`` field.
+
+    Providers word this several different ways, e.g.
+    ``"'temperature' is not supported with this model"`` (OpenAI),
+    ``"Unsupported value: 'temperature' does not support 0 with this model"``
+    (OpenAI reasoning models), and ``"temperature is not supported"`` /
+    ``"Unsupported parameter: 'temperature'"`` (vLLM, SGLang, some gateways).
+    """
+    if not body_text:
+        return False
+    lowered = body_text.lower()
+    if "temperature" not in lowered:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "not supported",
+            "unsupported",
+            "does not support",
+            "unrecognized request argument",
+            "unknown parameter",
+            "unexpected keyword",
+        )
+    )
+
+
 class AsyncLLMClient:
     """OpenAI-compatible async chat client.
 
@@ -55,7 +82,8 @@ class AsyncLLMClient:
         }
 
         max_retries = 6
-        for attempt in range(max_retries):
+        attempt = 0
+        while attempt < max_retries:
             try:
                 resp = await asyncio.to_thread(
                     self._client.chat.completions.create,
@@ -65,18 +93,25 @@ class AsyncLLMClient:
             except Exception as exc:
                 body_text = getattr(getattr(exc, "response", None), "text", "") or ""
                 status_code = getattr(getattr(exc, "response", None), "status_code", None)
-                if status_code == 400 and "'temperature' is not supported" in body_text:
-                    merged.pop("temperature", None)
-                    continue
+                if status_code == 400 and _is_unsupported_temperature_error(body_text):
+                    if "temperature" in merged:
+                        merged.pop("temperature", None)
+                        continue
+                    raise
                 if status_code == 400 and "Stream must be set to true" in body_text:
                     return await self._chat_via_stream(merged)
-                if attempt < max_retries - 1:
+                # A 4xx other than 429 is deterministic: the request itself is
+                # wrong (bad key, unknown model, oversized prompt). Retrying it
+                # just burns ~30s of backoff before surfacing the same error.
+                if status_code is not None and 400 <= status_code < 500 and status_code != 429:
+                    raise
+                attempt += 1
+                if attempt < max_retries:
                     import random
 
                     wait = min(2**attempt + random.uniform(0, 1), 30)
                     await asyncio.sleep(wait)
-                    continue
-                raise
+        raise RuntimeError(f"chat failed after {max_retries} attempts: model={self.model}")
 
     async def _chat_via_stream(self, body: dict[str, Any]) -> str:
         import json

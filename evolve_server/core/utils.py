@@ -13,9 +13,28 @@ from typing import Any, Optional
 # ------------------------------------------------------------------ #
 
 
+def strip_outer_code_fence(text: str) -> str:
+    """Remove only the wrapping ``` fence, leaving nested fences intact.
+
+    Evolved skills routinely contain fenced code blocks in their Markdown
+    body. A blanket ``re.sub(r"```(?:json)?\\s*", "", text)`` deletes those too
+    and destroys the JSON payload, so the evolution is silently discarded.
+    """
+    stripped = text.strip()
+    opened = re.match(r"^```(?:json|jsonc)?[ \t]*\r?\n?", stripped)
+    if not opened:
+        return stripped
+    without_open = stripped[opened.end() :]
+    # A closing fence only counts when it is the last non-blank thing left.
+    closed = re.search(r"\r?\n?```[ \t]*$", without_open)
+    if closed:
+        return without_open[: closed.start()].strip()
+    return without_open.strip()
+
+
 def parse_single_skill(text: str) -> Optional[dict]:
     """Extract a single skill JSON object from LLM output."""
-    clean = re.sub(r"```(?:json)?\s*", "", text.strip()).strip().rstrip("`")
+    clean = strip_outer_code_fence(text)
 
     try:
         obj = json.loads(clean)
@@ -103,18 +122,17 @@ def compact_tool_observations(
 def build_skill_md(skill: dict) -> str:
     """Render a skill dict into SKILL.md content (with YAML frontmatter)."""
     name = skill.get("name", "unknown")
-    description = skill.get("description", "")
-    category = skill.get("category", "general")
-    content = skill.get("content", "")
+    description = skill.get("description", "") or ""
+    category = skill.get("category", "general") or "general"
+    # The LLM may return an explicit null; concatenation would raise TypeError
+    # and lose the whole evolution.
+    content = skill.get("content") or ""
 
-    needs_quoting = any(c in description for c in ":{}[],\"'#&*!|>%@`\n")
-    if needs_quoting:
-        escaped = description.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
-        desc_line = f'description: "{escaped}"'
-    else:
-        desc_line = f"description: {description}"
-
-    fm_lines = [f"name: {name}", desc_line, f"category: {category}"]
+    fm_lines = [
+        _yaml_frontmatter_line("name", name),
+        _yaml_frontmatter_line("description", description),
+        _yaml_frontmatter_line("category", category),
+    ]
 
     extra_fm = skill.get("extra_frontmatter")
     if isinstance(extra_fm, dict):
@@ -125,6 +143,28 @@ def build_skill_md(skill: dict) -> str:
                 fm_lines.append(f"{key}: {yaml.dump(value, default_flow_style=True).strip()}")
 
     return "---\n" + "\n".join(fm_lines) + "\n---\n\n" + content + "\n"
+
+
+# YAML indicators that cannot start a plain scalar. "- run the tests" parses as
+# a sequence, "? x" and ": x" as complex keys, "#" as a comment — any of them
+# makes the frontmatter unparseable, so the skill publishes but is then dropped
+# by every consumer.
+_YAML_LEADING_INDICATORS = "-?:,[]{}#&*!|>'\"%@`"
+
+
+def _yaml_frontmatter_line(key: str, value: str) -> str:
+    """Render one frontmatter entry, quoting whenever a plain scalar is unsafe."""
+    text = str(value)
+    needs_quoting = (
+        not text
+        or text[0] in _YAML_LEADING_INDICATORS
+        or text != text.strip()
+        or any(c in text for c in ":{}[],\"'#&*!|>%@`\n")
+    )
+    if not needs_quoting:
+        return f"{key}: {text}"
+    escaped = text.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+    return f'{key}: "{escaped}"'
 
 
 def parse_skill_content(name: str, raw_md: str) -> dict[str, Any]:

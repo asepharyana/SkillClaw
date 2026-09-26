@@ -16,6 +16,7 @@ import re
 from typing import Any, Optional
 
 from ..core.llm_client import AsyncLLMClient
+from ..core.utils import strip_outer_code_fence
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,7 @@ def _is_number(value: Any) -> bool:
 
 
 def _extract_json_object(text: str) -> Optional[dict[str, Any]]:
-    clean = re.sub(r"```(?:json)?\s*", "", str(text or "")).strip().rstrip("`")
+    clean = strip_outer_code_fence(str(text or ""))
     if not clean:
         return None
     try:

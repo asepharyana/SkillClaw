@@ -20,10 +20,16 @@ class SkillBundleError(ValueError):
 
 
 def is_hermes_skill_root(skills_dir: str | os.PathLike[str]) -> bool:
-    """True для каталога скиллов hermes — он один допускает раскладку с категориями."""
-    return os.path.realpath(str(skills_dir)) == os.path.realpath(
-        os.path.join(os.path.expanduser("~"), ".hermes", "skills")
-    )
+    """True для каталога скиллов hermes — он один допускает раскладку с категориями.
+
+    Resolved through _paths.resolve_hermes_home so this agrees with
+    skill_hub._is_hermes_skill_root. Hardcoding ~/.hermes/skills here made the
+    two disagree whenever HERMES_HOME / SKILLCLAW_HERMES_HOME was set, and
+    iter_skill_md_paths then took the flat-layout branch and returned [].
+    """
+    from ._paths import resolve_hermes_home
+
+    return os.path.realpath(str(skills_dir)) == os.path.realpath(str(resolve_hermes_home() / "skills"))
 
 
 def iter_skill_md_paths(skills_dir: str | os.PathLike[str]) -> list[str]:

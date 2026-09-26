@@ -745,7 +745,8 @@ async def test_responses_continuation_deduplicates_replayed_output_items(tmp_pat
     ]
 
 
-def test_prepare_responses_forward_keeps_native_codex_items_out_of_chat_conversion():
+@pytest.mark.asyncio
+async def test_prepare_responses_forward_keeps_native_codex_items_out_of_chat_conversion():
     server = object.__new__(SkillClawAPIServer)
     server.config = SkillClawConfig(
         llm_api_base="http://upstream.test/v1/",
@@ -773,7 +774,7 @@ def test_prepare_responses_forward_keeps_native_codex_items_out_of_chat_conversi
         "turn_type": "user",
     }
 
-    url, send_body, headers = server._prepare_responses_forward(body, stream=True)
+    url, send_body, headers = await server._prepare_responses_forward(body, stream=True)
 
     assert url == "http://upstream.test/v1/responses"
     assert headers == {"Authorization": "Bearer upstream-key"}

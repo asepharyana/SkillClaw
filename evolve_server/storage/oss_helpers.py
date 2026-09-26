@@ -6,7 +6,7 @@ import json
 import logging
 from typing import Any, Optional
 
-from skillclaw.object_store import build_object_store
+from skillclaw.object_store import build_object_store, is_not_found_error
 from skillclaw.skill_bundle import (
     bundle_entrypoint_text,
     bundle_file_records,
@@ -75,12 +75,21 @@ def read_json_object(bucket, key: str) -> Optional[dict]:
 
 
 def load_manifest(bucket, prefix: str) -> dict[str, dict[str, Any]]:
-    """Load ``manifest.jsonl`` from storage. Returns ``{skill_name: record}``."""
+    """Load ``manifest.jsonl`` from storage. Returns ``{skill_name: record}``.
+
+    Only a genuinely absent manifest yields ``{}``. A transient read failure
+    used to look identical, and the caller's read-modify-write then saved back
+    a manifest missing every entry it did not know about — deleting other
+    skills from the shared library. Real errors propagate instead.
+    """
     key = f"{prefix}manifest.jsonl"
     try:
         data = bucket.get_object(key).read().decode("utf-8")
-    except Exception:
-        return {}
+    except Exception as exc:
+        if is_not_found_error(exc):
+            return {}
+        logger.error("[Storage] failed to read %s: %s", key, exc)
+        raise
 
     skills: dict[str, dict[str, Any]] = {}
     for line in data.strip().splitlines():

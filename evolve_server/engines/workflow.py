@@ -614,7 +614,11 @@ class EvolveServer(EvolveEngineMixin):
             )
             reject_ready = rejected >= self.config.validation_max_rejections
 
-            if publish_ready:
+            # Rejection wins over publication. Both can be true at once (one
+            # client approved while another rejected), and publishing first
+            # would `continue` past the reject branch, leaving
+            # validation_max_rejections as dead config.
+            if not reject_ready and publish_ready:
                 candidate_skill = job.get("candidate_skill")
                 if not isinstance(candidate_skill, dict) or not candidate_skill.get("name"):
                     self._validation_store.save_decision(

@@ -78,21 +78,34 @@ class LocalObjectStore:
     def __init__(self, root: str | Path) -> None:
         self._root = str(Path(root).expanduser())
 
+    def _resolve(self, key: str) -> str:
+        """Map a key to a path that provably stays inside the root.
+
+        Keys come from the shared manifest, so they are untrusted: a ``path``
+        of ``../../ssh_key`` would otherwise read or write anywhere the
+        process can reach. Resolve symlinks and require containment.
+        """
+        root = os.path.realpath(self._root)
+        path = os.path.realpath(os.path.join(root, key))
+        if path != root and not path.startswith(root + os.sep):
+            raise ValueError(f"LocalObjectStore: key escapes the storage root: {key!r}")
+        return path
+
     def get_object(self, key: str) -> _BytesObject:
-        path = os.path.join(self._root, key)
+        path = self._resolve(key)
         if not os.path.isfile(path):
             raise FileNotFoundError(f"LocalObjectStore: key not found: {key}")
         with open(path, "rb") as f:
             return _BytesObject(f.read(), key)
 
     def put_object(self, key: str, data: bytes | str | io.IOBase) -> None:
-        path = os.path.join(self._root, key)
+        path = self._resolve(key)
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "wb") as f:
             f.write(_read_bytes(data))
 
     def delete_object(self, key: str) -> None:
-        path = os.path.join(self._root, key)
+        path = self._resolve(key)
         if os.path.isfile(path):
             os.remove(path)
 

@@ -1,5 +1,3 @@
-import os
-
 from evolve_server.core.config import EvolveServerConfig
 from skillclaw.config import SkillClawConfig
 

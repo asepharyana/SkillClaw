@@ -33,7 +33,7 @@ def _get_llm_provider(config: Optional["SkillClawConfig"] = None) -> str:
     try:
         from .config_store import ConfigStore
 
-        cfg = ConfigStore().load()
+        cfg = ConfigStore().load_or_defaults()
         if isinstance(cfg, dict):
             llm_provider = str((cfg.get("llm", {}) or {}).get("provider", "") or "")
             if llm_provider == "bedrock":
@@ -91,7 +91,7 @@ def _run_llm_openai(messages, config: Optional["SkillClawConfig"] = None):
         try:
             from .config_store import ConfigStore
 
-            cfg = ConfigStore().load()
+            cfg = ConfigStore().load_or_defaults()
             if isinstance(cfg, dict):
                 llm_cfg = cfg.get("llm", {}) or {}
                 if isinstance(llm_cfg, dict):

@@ -7,17 +7,17 @@ Reads/writes ~/.skillclaw/config.yaml and bridges to SkillClawConfig.
 
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 from typing import Any
 
+from ._paths import resolve_hermes_home
 from .config import SkillClawConfig
 
 CONFIG_DIR = Path.home() / ".skillclaw"
 CONFIG_FILE = CONFIG_DIR / "config.yaml"
 _DEFAULT_SKILLS_DIR = CONFIG_DIR / "skills"
-from ._paths import resolve_hermes_home
-
 _DEFAULT_HERMES_SKILLS_DIR = resolve_hermes_home() / "skills"
 _DEFAULT_CODEX_SKILLS_DIR = Path.home() / ".codex" / "skills"
 _DEFAULT_CLAUDE_SKILLS_DIR = Path.home() / ".claude" / "skills"
@@ -26,6 +26,10 @@ _DEFAULT_LLM_API_MODE_BY_CLAW = {
     "codex": "responses",
 }
 _FALLBACK_LLM_API_MODE = "chat"
+# Mirrors SkillClawConfig's dataclass defaults, used when neither the `skills`
+# nor the `embedding` config section names a value.
+_DEFAULT_EMBEDDING_TYPE = "local"
+_DEFAULT_EMBEDDING_MODEL_PATH = "Qwen/Qwen3-Embedding-0.6B"
 _NACOS_PUBLISH_MODES = {"draft", "review", "direct"}
 _SKILL_RELOAD_MODES = {"off", "poll", "callback"}
 _MIN_SKILL_RELOAD_INTERVAL_SECONDS = 5
@@ -131,13 +135,53 @@ _DEFAULTS: dict = {
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
-    result = dict(base)
+    # Deep-copy both sides: a shallow copy hands callers a live reference to the
+    # nested _DEFAULTS dicts, so `ConfigStore.set()` would permanently mutate
+    # the module-level defaults for the rest of the process. Copying `override`
+    # too matters when base is empty, where every key is taken from override
+    # by reference.
+    result = copy.deepcopy(base)
     for k, v in override.items():
         if k in result and isinstance(result[k], dict) and isinstance(v, dict):
             result[k] = _deep_merge(result[k], v)
         else:
-            result[k] = v
+            result[k] = copy.deepcopy(v)
     return result
+
+
+class ConfigParseError(RuntimeError):
+    """Raised when the config file exists but cannot be parsed as a mapping."""
+
+
+def _as_section(data: dict, key: str) -> dict:
+    """Return ``data[key]`` when it is a mapping, else an empty dict.
+
+    A hand-edited config can easily contain `skills:` with nothing under it
+    (YAML null) or a stray scalar. Callers do `.get()` on the result, so a
+    non-mapping has to degrade to {} instead of raising AttributeError.
+    """
+    value = data.get(key)
+    return value if isinstance(value, dict) else {}
+
+
+def _as_int(value: Any, default: int) -> int:
+    """Coerce a config value to int, falling back to ``default``."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float) -> float:
+    """Coerce a config value to float, falling back to ``default``."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _coerce(value: Any) -> Any:
@@ -273,15 +317,34 @@ class ConfigStore:
         return self.config_file.exists()
 
     def load(self) -> dict:
+        """Parse the config file, falling back to defaults.
+
+        A file that exists but cannot be parsed raises ConfigParseError rather
+        than silently degrading to defaults: callers that write (set/save) would
+        otherwise overwrite the user's real config with a defaults-only file and
+        lose every setting they had. Read-only callers that want the old
+        lenient behaviour should catch ConfigParseError themselves.
+        """
         if not self.config_file.exists():
             return _deep_merge({}, _DEFAULTS)
         try:
             import yaml
 
             with open(self.config_file, "r", encoding="utf-8") as f:
-                data = yaml.safe_load(f) or {}
-            return _deep_merge(_DEFAULTS, data)
-        except Exception:
+                data = yaml.safe_load(f)
+        except Exception as exc:
+            raise ConfigParseError(f"could not parse {self.config_file}: {exc}") from exc
+        if data is None:
+            data = {}
+        if not isinstance(data, dict):
+            raise ConfigParseError(f"{self.config_file} must contain a YAML mapping, got {type(data).__name__}")
+        return _deep_merge(_DEFAULTS, data)
+
+    def load_or_defaults(self) -> dict:
+        """Lenient load for read-only paths; a broken file yields defaults."""
+        try:
+            return self.load()
+        except ConfigParseError:
             return _deep_merge({}, _DEFAULTS)
 
     def save(self, data: dict):
@@ -292,7 +355,7 @@ class ConfigStore:
             yaml.dump(data, f, default_flow_style=False, allow_unicode=True)
 
     def get(self, dotpath: str) -> Any:
-        data = self.load()
+        data = self.load_or_defaults()
         for k in dotpath.split("."):
             if not isinstance(data, dict):
                 return None
@@ -304,7 +367,11 @@ class ConfigStore:
         keys = dotpath.split(".")
         d = data
         for k in keys[:-1]:
-            d = d.setdefault(k, {})
+            # A scalar sitting where a section is needed (e.g. `llm: hello`)
+            # cannot be descended into; replace it rather than raising.
+            if not isinstance(d.get(k), dict):
+                d[k] = {}
+            d = d[k]
         d[keys[-1]] = _coerce(value)
         self.save(data)
 
@@ -313,8 +380,11 @@ class ConfigStore:
     # ------------------------------------------------------------------ #
 
     def to_skillclaw_config(self) -> SkillClawConfig:
-        data = self.load()
-        llm = data.get("llm", {})
+        data = self.load_or_defaults()
+        # A hand-edited config can leave a section as null (`skills:`) or a bare
+        # scalar (`llm: hello`). Coerce anything that is not a mapping back to
+        # {} so startup degrades to defaults instead of raising.
+        llm = _as_section(data, "llm")
         llm_provider = llm.get("provider", "openai")
         llm_api_base = llm.get("api_base", "")
         llm_api_key = llm.get("api_key", "")
@@ -322,19 +392,20 @@ class ConfigStore:
         raw_claw_type = str(data.get("claw_type", "openclaw") or "openclaw")
         default_api_mode = default_llm_api_mode_for_claw(raw_claw_type)
         llm_api_mode = str(llm.get("api_mode", default_api_mode) or default_api_mode)
-        proxy = data.get("proxy", {})
-        skills = data.get("skills", {})
-        record = data.get("record", {})
-        orouter = data.get("openrouter", {})
-        prm = data.get("prm", {})
+        proxy = _as_section(data, "proxy")
+        skills = _as_section(data, "skills")
+        embedding = _as_section(data, "embedding")
+        record = _as_section(data, "record")
+        orouter = _as_section(data, "openrouter")
+        prm = _as_section(data, "prm")
         configure_openclaw = bool(data.get("configure_openclaw", True))
         if not configure_openclaw:
             raw_claw_type = "none"
 
-        sharing = data.get("sharing", {})
-        evolve = data.get("evolve", {})
-        validation = data.get("validation", {})
-        dashboard = data.get("dashboard", {})
+        sharing = _as_section(data, "sharing")
+        evolve = _as_section(data, "evolve")
+        validation = _as_section(data, "validation")
+        dashboard = _as_section(data, "dashboard")
         sharing_backend = _infer_sharing_backend(sharing)
         sharing_endpoint = _first_non_empty(sharing, "endpoint")
         sharing_bucket = _first_non_empty(sharing, "bucket")
@@ -355,7 +426,7 @@ class ConfigStore:
         prm_model = str(prm.get("model", "") or llm_model_id or "gpt-5.2")
         prm_api_key = str(prm.get("api_key", "") or llm_api_key)
         _prm_temperature = prm.get("temperature")
-        prm_temperature = float(_prm_temperature) if _prm_temperature is not None else 0.6
+        prm_temperature = _as_float(_prm_temperature, 0.6)
 
         skills_dir = resolve_skills_dir(
             skills.get("dir", str(_DEFAULT_SKILLS_DIR)),
@@ -378,7 +449,7 @@ class ConfigStore:
             openrouter_fallback_models=orouter.get("fallback_models", ""),
             openrouter_data_policy=orouter.get("data_policy", ""),
             # Proxy
-            proxy_port=proxy.get("port", 30000),
+            proxy_port=_as_int(proxy.get("port"), 30000),
             proxy_host=proxy.get("host", "0.0.0.0"),
             proxy_api_key=str(proxy.get("api_key", "") or ""),
             record_enabled=bool(record.get("enabled", True)),
@@ -391,8 +462,29 @@ class ConfigStore:
             skills_dir=skills_dir,
             skills_public_root=str(skills.get("public_root", "") or ""),
             retrieval_mode=skills.get("retrieval_mode", "template"),
-            skill_top_k=int(skills.get("top_k", 6)),
-            max_context_tokens=int(data.get("max_context_tokens", 20000) or 20000),
+            skill_top_k=_as_int(skills.get("top_k"), 6),
+            # Embeddings. These live under `skills:` (documented) and, for
+            # compatibility with older configs, may also appear in a top-level
+            # `embedding:` section. Without this mapping an operator setting
+            # embedding_type: api silently got the local model instead.
+            embedding_type=str(
+                skills.get("embedding_type") or embedding.get("type") or _DEFAULT_EMBEDDING_TYPE
+            ).strip(),
+            embedding_model_path=str(
+                skills.get("embedding_model_path")
+                or embedding.get("model_path")
+                or _DEFAULT_EMBEDDING_MODEL_PATH
+            ).strip(),
+            embedding_api_url=str(
+                skills.get("embedding_api_url") or embedding.get("api_url") or ""
+            ).strip(),
+            embedding_api_model=str(
+                skills.get("embedding_api_model") or embedding.get("api_model") or ""
+            ).strip(),
+            embedding_api_key=str(
+                skills.get("embedding_api_key") or embedding.get("api_key") or ""
+            ).strip(),
+            max_context_tokens=_as_int(data.get("max_context_tokens"), 20000),
             # PRM
             use_prm=bool(prm.get("enabled", True)),
             prm_provider=prm_provider,
@@ -435,8 +527,8 @@ class ConfigStore:
             sharing_group_id=str(sharing.get("group_id", "default") or "default"),
             sharing_user_alias=str(sharing.get("user_alias", "") or ""),
             sharing_auto_pull_on_start=bool(sharing.get("auto_pull_on_start", False)),
-            sharing_push_min_injections=int(sharing.get("push_min_injections", 5)),
-            sharing_push_min_effectiveness=float(sharing.get("push_min_effectiveness", 0.3)),
+            sharing_push_min_injections=_as_int(sharing.get("push_min_injections"), 5),
+            sharing_push_min_effectiveness=_as_float(sharing.get("push_min_effectiveness"), 0.3),
             sharing_session_upload_interval=_normalize_non_negative_int(
                 sharing.get("session_upload_interval", 0),
                 default=0,
@@ -453,13 +545,13 @@ class ConfigStore:
             evolve_proxy_reload_url=str(evolve.get("proxy_reload_url", "") or ""),
             validation_enabled=bool(validation.get("enabled", False)),
             validation_mode=_normalize_validation_mode(validation.get("mode", "replay")),
-            validation_idle_after_seconds=int(validation.get("idle_after_seconds", 300)),
-            validation_poll_interval_seconds=int(validation.get("poll_interval_seconds", 60)),
-            validation_max_jobs_per_day=int(validation.get("max_jobs_per_day", 5)),
-            validation_max_concurrency=max(1, int(validation.get("max_concurrency", 1))),
+            validation_idle_after_seconds=_as_int(validation.get("idle_after_seconds"), 300),
+            validation_poll_interval_seconds=_as_int(validation.get("poll_interval_seconds"), 60),
+            validation_max_jobs_per_day=_as_int(validation.get("max_jobs_per_day"), 5),
+            validation_max_concurrency=max(1, _as_int(validation.get("max_concurrency"), 1)),
             dashboard_enabled=bool(dashboard.get("enabled", False)),
             dashboard_host=str(dashboard.get("host", "127.0.0.1") or "127.0.0.1"),
-            dashboard_port=int(dashboard.get("port", 3788) or 3788),
+            dashboard_port=_as_int(dashboard.get("port"), 3788),
             dashboard_db_path=str(
                 dashboard.get("db_path", str(CONFIG_DIR / "dashboard.db")) or str(CONFIG_DIR / "dashboard.db")
             ),
@@ -470,7 +562,7 @@ class ConfigStore:
 
     def describe(self) -> str:
         """Return a human-readable summary of the current config."""
-        data = self.load()
+        data = self.load_or_defaults()
         llm = data.get("llm", {})
         skills = data.get("skills", {})
         prm = data.get("prm", {})

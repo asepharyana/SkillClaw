@@ -8,6 +8,63 @@ import time
 from typing import Any, AsyncIterator
 
 
+def _usage_count(usage: dict[str, Any], *keys: str) -> int:
+    """Read a token count, accepting either the chat or Responses spelling.
+
+    Upstreams that speak the Responses shape send input_tokens/output_tokens
+    while chat-completions upstreams send prompt_tokens/completion_tokens.
+    """
+    for key in keys:
+        value = usage.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _usage_total(usage: dict[str, Any]) -> int:
+    """Total tokens, summed from the parts when the upstream omits it."""
+    total = usage.get("total_tokens")
+    if total is not None:
+        try:
+            return int(total)
+        except (TypeError, ValueError):
+            pass
+    return _usage_count(usage, "prompt_tokens", "input_tokens") + _usage_count(
+        usage, "completion_tokens", "output_tokens"
+    )
+
+
+def _in_progress_item(item: dict[str, Any]) -> dict[str, Any]:
+    """Strip a finished output item down to its in-progress shape.
+
+    Mirrors what the Responses API sends in `response.output_item.added`:
+    the type/id/role are known, but the content that arrives as deltas is
+    still empty and the status is ``in_progress``.
+    """
+    if item.get("type") == "function_call":
+        return {
+            "type": "function_call",
+            "id": item.get("id", ""),
+            "call_id": item.get("call_id", ""),
+            "name": item.get("name", ""),
+            "arguments": "",
+            "status": "in_progress",
+        }
+    if item.get("type") == "message":
+        return {
+            "type": "message",
+            "id": item.get("id", ""),
+            "role": item.get("role", "assistant"),
+            "content": [],
+            "status": "in_progress",
+        }
+    return dict(item)
+
+
 def normalize_content_to_text(content: Any) -> str:
     """Flatten Responses-style content blocks to plain text."""
     if isinstance(content, str):
@@ -262,7 +319,7 @@ def from_openai_chat_payload(payload: dict[str, Any], model: str) -> dict[str, A
     response_payload = {
         "id": payload.get("id") or f"resp_skillclaw_{int(time.time() * 1000)}",
         "object": "response",
-        "created_at": payload.get("created", int(time.time())),
+        "created_at": payload.get("created") or int(time.time()),
         "status": "completed",
         "model": model,
         "output": output_items,
@@ -270,9 +327,9 @@ def from_openai_chat_payload(payload: dict[str, Any], model: str) -> dict[str, A
         "tool_choice": "auto",
         "tools": [],
         "usage": {
-            "input_tokens": int(usage.get("prompt_tokens", 0) or 0),
-            "output_tokens": int(usage.get("completion_tokens", 0) or 0),
-            "total_tokens": int(usage.get("total_tokens", 0) or 0),
+            "input_tokens": _usage_count(usage, "prompt_tokens", "input_tokens"),
+            "output_tokens": _usage_count(usage, "completion_tokens", "output_tokens"),
+            "total_tokens": _usage_total(usage),
         },
     }
     if content_text:
@@ -298,7 +355,17 @@ async def stream_response(response_payload: dict[str, Any]) -> AsyncIterator[str
     yield event({"type": "response.in_progress", "response": initial_response})
 
     for index, item in enumerate(response_payload.get("output", [])):
-        yield event({"type": "response.output_item.added", "output_index": index, "item": item})
+        # `.added` must carry the in-progress item, not the finished one.
+        # Clients accumulate deltas by appending to the item they received
+        # here, so shipping the completed item makes every delta count twice —
+        # a tool call arrives as `{"cmd":"ls"}{"cmd":"ls"}`.
+        yield event(
+            {
+                "type": "response.output_item.added",
+                "output_index": index,
+                "item": _in_progress_item(item),
+            }
+        )
 
         if item.get("type") == "function_call":
             arguments = str(item.get("arguments") or "")

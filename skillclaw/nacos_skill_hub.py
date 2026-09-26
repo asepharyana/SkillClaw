@@ -25,6 +25,7 @@ from .skill_bundle import (
     bundle_entrypoint_text,
     bundle_file_records,
     bundle_tree_sha256,
+    iter_skill_md_paths,
     read_skill_bundle_with_meta,
     write_skill_bundle,
 )
@@ -243,7 +244,14 @@ def _largest_nacos_version(versions: list[str]) -> str | None:
     v_versions = [(parsed, version) for version in versions if (parsed := _parse_v_version(version)) is not None]
     if v_versions:
         return max(v_versions, key=lambda item: item[0])[1]
-    return max(versions) if versions else None
+    if not versions:
+        return None
+    # Unrecognised formats still have to order numerically when they look like
+    # bare integers, otherwise "12" loses to "7" under a string comparison.
+    numeric = [(int(version), version) for version in versions if version.strip().lstrip("+-").isdigit()]
+    if numeric:
+        return max(numeric, key=lambda item: item[0])[1]
+    return max(versions)
 
 
 def _nacos_working_version(
@@ -387,10 +395,10 @@ class NacosSkillHub:
         skills_dir: str,
         skill_filter: Optional[dict[str, Any]] = None,
     ) -> dict[str, Any]:
-        if _is_hermes_skill_root(skills_dir):
-            paths = sorted(Path(skills_dir).glob("**/SKILL.md"))
-        else:
-            paths = sorted(Path(skills_dir).glob("*/SKILL.md"))
+        # iter_skill_md_paths is the single traversal rule: a **/SKILL.md picks
+        # up examples/ and other nested bundles inside someone else's skill,
+        # which push then publishes and pull then mirror-deletes as stale.
+        paths = [Path(p) for p in iter_skill_md_paths(skills_dir)]
         if not paths:
             return {"uploaded": 0, "skipped": 0, "filtered": 0, "submitted": 0, "published": 0, "total_local": 0}
 

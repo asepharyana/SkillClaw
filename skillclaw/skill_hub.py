@@ -793,7 +793,11 @@ class SkillHub:
         # Сверяем хэши до копирования: mirror-pull переписывает весь каталог (бэкап + staging)
         # на каждом цикле поллера, а обычно менять нечего — 102 скилла копировались раз в 30 секунд.
         if self._mirror_pull_is_noop(skills_dir, manifest, local_skills, local_dirs_by_name, skip_set):
-            logger.info("[SkillHub] pull complete: 0 downloaded, %d skipped, 0 deleted, %d total remote", len(manifest), len(manifest))
+            logger.info(
+                "[SkillHub] pull complete: 0 downloaded, %d skipped, 0 deleted, %d total remote",
+                len(manifest),
+                len(manifest),
+            )
             return _result(
                 downloaded=0,
                 skipped=len(manifest),

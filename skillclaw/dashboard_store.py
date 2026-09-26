@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -30,12 +31,24 @@ class DashboardStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = str(Path(db_path).expanduser())
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self):
+        """Yield a configured connection and always close it.
+
+        ``sqlite3.Connection`` is its own context manager, but ``with conn:``
+        only commits or rolls back the transaction — it never closes the
+        handle. Using it directly leaked one file descriptor per dashboard
+        query, so wrap it in a real context manager instead.
+        """
         path = Path(self.db_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(path, timeout=30)
         conn.row_factory = sqlite3.Row
-        return conn
+        try:
+            with conn:
+                yield conn
+        finally:
+            conn.close()
 
     def initialize(self) -> None:
         with self._connect() as conn:

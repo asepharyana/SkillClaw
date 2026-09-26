@@ -147,10 +147,14 @@ def _build_flat_trajectory(turns: list[dict], first_prompt: str) -> str:
 
 def _build_rollout_trajectory(turns: list[dict], first_prompt: str) -> str:
     """Multi-rollout aggregated trajectory with per-rollout headers."""
-    # Group turns by _rollout_idx
+    # Group turns by _rollout_idx. A turn may carry an explicit null, which
+    # .get's default does not replace — sorting mixed int/None keys raises and
+    # aborts the whole summarization cycle, so normalise to 0.
     rollouts: dict[int, list[dict]] = {}
     for t in turns:
-        idx = t.get("_rollout_idx", 0)
+        idx = t.get("_rollout_idx")
+        if idx is None:
+            idx = 0
         rollouts.setdefault(idx, []).append(t)
 
     blocks: list[str] = []
@@ -395,7 +399,8 @@ async def summarize_session(llm: AsyncLLMClient, session: dict) -> str:
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
     ]
     try:
-        return await llm.chat(messages, max_tokens=min(int(getattr(llm, "max_tokens", 8192) or 8192), 8192), temperature=0.2)
+        max_tokens = min(int(getattr(llm, "max_tokens", 8192) or 8192), 8192)
+        return await llm.chat(messages, max_tokens=max_tokens, temperature=0.2)
     except Exception as e:
         logger.warning(
             "[Summarizer] LLM call failed for session %s: %s",

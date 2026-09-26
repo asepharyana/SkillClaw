@@ -67,7 +67,13 @@ def _flatten_message_content(content) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+        # A part with a null or non-string `text` is legal input from a
+        # misbehaving client; join() would raise on it, so filter to strings.
+        parts = [
+            text
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text" and isinstance((text := item.get("text")), str)
+        ]
         return " ".join(parts) if parts else ""
     return str(content) if content is not None else ""
 
@@ -208,6 +214,42 @@ def _extract_modified_skill_names(turns: list[dict] | None) -> set[str]:
         if isinstance(turn, dict):
             names.update(_extract_skill_names(turn.get("modified_skills")))
     return names
+
+
+def _is_unsupported_temperature_error(body_text: str) -> bool:
+    """True when a 400 says the model or route rejects the ``temperature`` field.
+
+    Providers word this several ways — ``"'temperature' is not supported with
+    this model"``, ``"Unsupported value: 'temperature' does not support 0"``,
+    ``"Unsupported parameter: 'temperature'"`` — so match on the intent rather
+    than one exact sentence.
+    """
+    if not body_text:
+        return False
+    lowered = body_text.lower()
+    if "temperature" not in lowered:
+        return False
+    return any(
+        marker in lowered
+        for marker in (
+            "not supported",
+            "unsupported",
+            "does not support",
+            "unrecognized request argument",
+            "unknown parameter",
+            "unexpected keyword",
+        )
+    )
+
+
+def _coerce_int(value: Any, default: int) -> int:
+    """int() with a fallback, so a client-supplied "auto" cannot 500 the proxy."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _llm_request_timeout_seconds() -> float:
@@ -1478,6 +1520,12 @@ def _message_drop_units(messages: list[dict]) -> list[list[int]]:
     one unit: keeping a result without the turn that issued its ``tool_call_id``
     produces an orphan tool message, which OpenAI-compatible upstreams reject
     with ``400 invalid_request_error``. Every other message is its own unit.
+
+    The Responses bridge emits one assistant message per ``function_call`` item,
+    so parallel tool calls arrive as consecutive assistant siblings followed by
+    their results. Those siblings and all their results form a single unit:
+    grouping only an assistant with *following* results would let truncation
+    drop one sibling and orphan the other's result.
     """
     units: list[list[int]] = []
     index = 0
@@ -1488,9 +1536,21 @@ def _message_drop_units(messages: list[dict]) -> list[list[int]]:
             index += 1
             continue
 
+        # Absorb every consecutive assistant message that also issues tool
+        # calls: they belong to the same tool round.
         group = [index]
         group_ids = set(_message_tool_call_ids(message))
         index += 1
+        while (
+            index < len(messages)
+            and isinstance(messages[index], dict)
+            and messages[index].get("role") == "assistant"
+            and _message_tool_call_ids(messages[index])
+        ):
+            group_ids |= _message_tool_call_ids(messages[index])
+            group.append(index)
+            index += 1
+        # Then absorb the results answering any id in the group.
         while index < len(messages) and _message_tool_call_ids(messages[index]) & group_ids:
             group_ids |= _message_tool_call_ids(messages[index])
             group.append(index)
@@ -2489,13 +2549,22 @@ class SkillClawAPIServer:
                 _prompt_len([{"role": "system", "content": cached_system}]),
             )
 
+        forward_body = {k: v for k, v in body.items() if k not in _NON_STANDARD_BODY_KEYS}
+        # Cap BEFORE sizing the prompt budget. Deriving the budget from the raw
+        # client value let a large max_tokens make max_prompt negative, which
+        # skipped truncation entirely and forwarded an over-limit prompt — the
+        # exact failure _cap_completion_token_fields exists to prevent.
+        _cap_completion_token_fields(forward_body)
+        requested_completion = _coerce_int(
+            forward_body.get("max_completion_tokens", forward_body.get("max_tokens")),
+            2048,
+        )
+
         # Truncate to fit within max_context_tokens (keep system + most-recent messages)
-        max_prompt = self.config.max_context_tokens - int(body.get("max_tokens") or 2048)
+        max_prompt = self.config.max_context_tokens - requested_completion
         if max_prompt > 0:
             messages = self._truncate_messages(messages, tools, max_prompt)
 
-        forward_body = {k: v for k, v in body.items() if k not in _NON_STANDARD_BODY_KEYS}
-        _cap_completion_token_fields(forward_body)
         forward_body["stream"] = False
         forward_body.pop("stream_options", None)
         if "model" not in forward_body:
@@ -2505,7 +2574,10 @@ class SkillClawAPIServer:
         output = await self._forward_to_llm(forward_body)
         output["model"] = forward_body.get("model") or self._served_model
 
-        choice = output.get("choices", [{}])[0]
+        # .get(k, default) only fires when the key is absent; a present-but-empty
+        # list (content filter, truncated upstream response) would IndexError.
+        choices = output.get("choices") or [{}]
+        choice = choices[0] if choices else {}
         assistant_msg = choice.get("message", {})
         if not isinstance(assistant_msg, dict):
             assistant_msg = {"role": "assistant", "content": _flatten_message_content(assistant_msg)}
@@ -2664,13 +2736,17 @@ class SkillClawAPIServer:
         """Return whether upstream auth should use ChatGPT-account OAuth."""
         return str(getattr(self.config, "llm_provider", "") or "").strip().lower() == "codex_oauth"
 
-    def _build_upstream_auth_headers(self, api_base: str) -> dict[str, str]:
+    async def _build_upstream_auth_headers(self, api_base: str) -> dict[str, str]:
         """Build upstream auth headers for the configured provider.
 
         For ``codex_oauth`` this resolves a live ChatGPT-account OAuth token
         (refreshing it only when actually expired) plus the harness-identity
         headers OpenAI's Codex endpoint requires.  Every other provider keeps
         the historical static-API-key behavior.
+
+        Async because the OAuth path does blocking file I/O and, on an expired
+        token, a blocking HTTP refresh with a 20s timeout. Running that inline
+        on the event loop stalls every concurrent request behind it.
         """
         if not self._codex_oauth_enabled():
             if self.config.llm_api_key:
@@ -2680,7 +2756,7 @@ class SkillClawAPIServer:
         from . import codex_oauth
 
         try:
-            return codex_oauth.build_auth_headers(api_base)
+            return await asyncio.to_thread(codex_oauth.build_auth_headers, api_base)
         except codex_oauth.CodexAuthError as e:
             detail = f"Codex OAuth auth failed: {e}"
             if getattr(e, "relogin_required", False):
@@ -2688,7 +2764,7 @@ class SkillClawAPIServer:
             logger.error("[CodexOAuth] %s", detail)
             raise HTTPException(status_code=401, detail=detail) from e
 
-    def _prepare_responses_forward(
+    async def _prepare_responses_forward(
         self,
         body: dict[str, Any],
         *,
@@ -2711,7 +2787,7 @@ class SkillClawAPIServer:
         send_body["model"] = self.config.llm_model_id or body.get("model", "")
         send_body["stream"] = stream
 
-        headers = self._build_upstream_auth_headers(api_base)
+        headers = await self._build_upstream_auth_headers(api_base)
         return f"{api_base}/responses", send_body, headers
 
     def _prepare_native_responses_body(self, body: dict[str, Any], *, turn_type: str) -> dict[str, Any]:
@@ -2820,7 +2896,7 @@ class SkillClawAPIServer:
         """Forward a Codex Responses payload to an upstream Responses API."""
         import httpx
 
-        url, send_body, headers = self._prepare_responses_forward(body, stream=False)
+        url, send_body, headers = await self._prepare_responses_forward(body, stream=False)
 
         max_retries = 3
         for attempt in range(max_retries):
@@ -2980,7 +3056,7 @@ class SkillClawAPIServer:
         """Passthrough upstream Responses SSE without aggregating or rewriting events."""
         import httpx
 
-        url, send_body, headers = self._prepare_responses_forward(body, stream=True)
+        url, send_body, headers = await self._prepare_responses_forward(body, stream=True)
         try:
             async with httpx.AsyncClient(timeout=_llm_request_timeout_seconds()) as client:
                 async with client.stream("POST", url, json=send_body, headers=headers) as resp:
@@ -3086,7 +3162,7 @@ class SkillClawAPIServer:
         api_base = self.config.llm_api_base.rstrip("/")
         send_body = self._chat_body_to_responses(body)
         send_body["stream"] = True
-        headers = self._build_upstream_auth_headers(api_base)
+        headers = await self._build_upstream_auth_headers(api_base)
 
         final_payload: dict[str, Any] = {}
         text_parts: list[str] = []
@@ -3155,7 +3231,7 @@ class SkillClawAPIServer:
         _normalize_openai_chat_token_fields(send_body)
         send_body["stream"] = False
 
-        headers = self._build_upstream_auth_headers(api_base)
+        headers = await self._build_upstream_auth_headers(api_base)
 
         # OpenRouter-specific headers and body extensions
         if self.config.llm_provider == "openrouter":
@@ -3191,7 +3267,16 @@ class SkillClawAPIServer:
                     return resp.json()
             except httpx.HTTPStatusError as e:
                 response_text = e.response.text[:200]
-                if e.response.status_code == 400 and "'temperature' is not supported" in e.response.text:
+                if e.response.status_code == 400 and _is_unsupported_temperature_error(e.response.text):
+                    if "temperature" not in send_body or attempt >= max_retries - 1:
+                        # Nothing left to drop, or the budget is spent: fall
+                        # through to the terminal 502 instead of `continue`,
+                        # which would exit the loop and return None.
+                        logger.error("[OpenClaw] upstream still rejects temperature after retries")
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"Upstream LLM rejects temperature: {e}",
+                        ) from e
                     logger.info("[OpenClaw] upstream rejects temperature param, retrying without it")
                     send_body.pop("temperature", None)
                     continue
@@ -3465,9 +3550,11 @@ class SkillClawAPIServer:
         if original_tokens <= max_prompt_tokens:
             return messages
 
-        # Split into system and non-system messages
-        sys_msgs = [m for m in messages if m.get("role") == "system"]
-        non_sys = [m for m in messages if m.get("role") != "system"]
+        # Split into system and non-system messages. A client can POST a bare
+        # string as a message, so guard the attribute access like every other
+        # helper in this file does.
+        sys_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
+        non_sys = [m for m in messages if isinstance(m, dict) and m.get("role") != "system"]
 
         # A role:tool message is only valid when the assistant turn that issued
         # its tool_call_id is still present. Dropping messages one at a time can
@@ -3540,7 +3627,7 @@ class SkillClawAPIServer:
         self.skill_manager.record_injection(skill_names)
 
         messages = list(messages)
-        sys_indices = [i for i, m in enumerate(messages) if m.get("role") == "system"]
+        sys_indices = [i for i, m in enumerate(messages) if isinstance(m, dict) and m.get("role") == "system"]
         if sys_indices:
             idx = sys_indices[0]
             existing = _flatten_message_content(messages[idx].get("content", ""))
@@ -3573,7 +3660,11 @@ class SkillClawAPIServer:
                     prm_result = prm_task.result()
                 except (asyncio.CancelledError, Exception):
                     pass
-                prm_tasks.pop(turn_num, None)
+            # Always drop the task entry once the turn is finalized. Leaving it
+            # here (only reachable from the branch above) leaked a completed
+            # asyncio.Task per turn for the session's lifetime, and
+            # _collect_active_session_ids keys off this dict.
+            prm_tasks.pop(turn_num, None)
 
             self._safe_create_task(
                 self._finalize_turn_feedback(
@@ -3623,7 +3714,7 @@ class SkillClawAPIServer:
         chunk_base = {
             "id": payload.get("id", ""),
             "object": "chat.completion.chunk",
-            "created": payload.get("created", int(time.time())),
+            "created": payload.get("created") or int(time.time()),
             "model": payload.get("model", ""),
             "session_id": payload.get("session_id", ""),
         }

@@ -25,7 +25,7 @@ except ImportError:
     sys.exit(1)
 
 from . import runtime_state
-from .config_store import CONFIG_FILE, ConfigStore
+from .config_store import ConfigStore
 
 
 def _default_daemon_log_path() -> Path:
@@ -345,7 +345,8 @@ def stop():
         click.echo("Process not found — cleaning up stale PID file.")
         pid_file.unlink(missing_ok=True)
     except Exception as e:
-        click.echo(f"Error stopping SkillClaw: {e}", err=True)
+        # A failed stop must not look like success to a calling script or CI.
+        raise click.ClickException(f"Error stopping SkillClaw: {e}") from e
 
 
 @skillclaw.command()
@@ -386,7 +387,7 @@ def config_cmd(key_or_action: str, value: str | None):
         if not cs.exists():
             click.echo("No config file found. Run 'skillclaw setup' first.")
             return
-        click.echo(f"Config file: {CONFIG_FILE}\n")
+        click.echo(f"Config file: {cs.config_file}\n")
         click.echo(cs.describe())
         return
 

@@ -421,7 +421,18 @@ class AgentEvolveServer(EvolveEngineMixin):
             self._bucket,
             self._prefix,
         )
-        await self._call_storage(delete_session_keys, self._bucket, session_keys)
+        # A failed agent run (timeout, non-zero exit) produced no usable edits.
+        # Deleting the drained sessions anyway destroys the evolution data with
+        # no retry, so keep them for the next cycle — same guard the workflow
+        # engine applies via had_processing_error.
+        if getattr(result, "returncode", 0) != 0:
+            logger.warning(
+                "[AgentEvolveServer] agent exited %s; retaining %d sessions for retry",
+                result.returncode,
+                len(session_keys),
+            )
+        else:
+            await self._call_storage(delete_session_keys, self._bucket, session_keys)
 
         self._workspace.cleanup_sessions()
 

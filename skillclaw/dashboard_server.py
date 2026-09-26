@@ -379,6 +379,11 @@ class DashboardService:
                 document = str(version_payload.get("skill_md") or version_payload.get("content") or "").strip()
                 if self._requires_full_bundle(current_bundle_record):
                     raise ValueError("selected version only has a SKILL.md snapshot; full bundle replay is unavailable")
+                # Validate BEFORE writing. Overwriting SKILL.md first and then
+                # raising left the local skill blanked out while the API
+                # reported only that the request had failed.
+                if not document:
+                    raise ValueError("selected version does not include a document snapshot")
                 self._write_document_version(skill_root, document)
             label = f"共享 v{version_num}"
         else:

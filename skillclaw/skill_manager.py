@@ -52,6 +52,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from collections import Counter
 from typing import Any, Dict, Optional
@@ -236,11 +237,33 @@ class SkillManager:
             return {}
 
     def _save_stats(self) -> None:
+        # Write via a temp file + rename: a crash mid-dump would otherwise
+        # leave a truncated skill_stats.json and lose every effectiveness score.
+        path = self._stats_path()
+        tmp_path = None
         try:
-            with open(self._stats_path(), "w", encoding="utf-8") as f:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=os.path.dirname(path) or ".",
+                prefix=".skill_stats.",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                tmp_path = f.name
                 json.dump(self._stats, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+            tmp_path = None
         except OSError as e:
             logger.warning("[SkillManager] failed to save stats: %s", e)
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
     def _maybe_flush_stats(self) -> None:
         """Persist stats every 10 mutations to avoid excessive I/O."""
@@ -281,7 +304,11 @@ class SkillManager:
             else:
                 entry["neutral_count"] += 1
             total = entry["inject_count"]
-            entry["effectiveness"] = entry["positive_count"] / total if total > 0 else 0.5
+            # Feedback is recorded once for the injected list and again for the
+            # read list, so positives can exceed injections. Clamp to keep the
+            # score a probability — the push quality gate compares it to a
+            # 0..1 threshold.
+            entry["effectiveness"] = min(1.0, entry["positive_count"] / total) if total > 0 else 0.5
         self._maybe_flush_stats()
 
     def get_effectiveness(self, skill_name: str) -> float:

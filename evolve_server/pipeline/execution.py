@@ -18,7 +18,7 @@ from typing import Optional
 
 from ..core.constants import DecisionAction
 from ..core.llm_client import AsyncLLMClient
-from ..core.utils import parse_single_skill
+from ..core.utils import parse_single_skill, strip_outer_code_fence
 
 logger = logging.getLogger(__name__)
 
@@ -423,9 +423,8 @@ async def create_skill_from_sessions(
 def _parse_evolve_result(raw: str, skill_name: str) -> Optional[dict]:
     """Parse the combined decision+execution JSON from the LLM."""
     import json
-    import re
 
-    clean = re.sub(r"```(?:json)?\s*", "", raw.strip()).strip().rstrip("`")
+    clean = strip_outer_code_fence(raw)
 
     try:
         result = json.loads(clean)

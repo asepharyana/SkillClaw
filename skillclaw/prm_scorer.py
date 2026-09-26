@@ -159,7 +159,11 @@ class PRMScorer:
             except ImportError as e:
                 raise ImportError("PRMScorer requires the 'openai' package. Install it with: pip install openai") from e
             base_url = prm_url.rstrip("/")
-            client_kwargs: dict[str, Any] = {"api_key": api_key}
+            # The OpenAI SDK refuses to construct without a key, but the
+            # documented use case here is an unauthenticated local endpoint
+            # (vLLM/LiteLLM). Send a placeholder so no Authorization header is
+            # produced upstream; the URL decides whether auth is checked.
+            client_kwargs: dict[str, Any] = {"api_key": api_key or "not-required"}
             client_kwargs["base_url"] = base_url
             self._client = OpenAI(**client_kwargs)
 

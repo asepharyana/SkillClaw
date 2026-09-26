@@ -38,10 +38,10 @@ import yaml
 if TYPE_CHECKING:
     from .config import SkillClawConfig
 
-logger = logging.getLogger(__name__)
-_LEGACY_SKILLCLAW_SKILLS_DIR = Path.home() / ".skillclaw" / "skills"
 from ._paths import resolve_hermes_config, resolve_hermes_home
 
+logger = logging.getLogger(__name__)
+_LEGACY_SKILLCLAW_SKILLS_DIR = Path.home() / ".skillclaw" / "skills"
 _HERMES_HOME = resolve_hermes_home()
 _HERMES_SKILLS_DIR = _HERMES_HOME / "skills"
 # Named provider entry registered in Hermes' ``providers:`` map when SkillClaw

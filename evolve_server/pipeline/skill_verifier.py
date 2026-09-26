@@ -16,6 +16,7 @@ from typing import Any, Optional
 
 from ..core.constants import DecisionAction
 from ..core.llm_client import AsyncLLMClient
+from ..core.utils import strip_outer_code_fence
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +78,7 @@ def _clip_text(value: Any, max_chars: int) -> str:
 
 
 def _extract_json_object(text: str) -> Optional[dict[str, Any]]:
-    clean = re.sub(r"```(?:json)?\s*", "", str(text or "")).strip().rstrip("`")
+    clean = strip_outer_code_fence(str(text or ""))
     if not clean:
         return None
     try:

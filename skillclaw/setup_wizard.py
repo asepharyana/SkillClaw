@@ -99,7 +99,15 @@ def _prompt_bool(msg: str, default: bool = False) -> bool:
     val = _prompt(f"{msg} ({default_str})")
     if not val:
         return default
-    return val.lower() in {"y", "yes", "true", "1"}
+    answer = val.strip().lower()
+    if answer in {"y", "yes", "true", "1", "on"}:
+        return True
+    if answer in {"n", "no", "false", "0", "off"}:
+        return False
+    # Anything else is a typo or a stray word ("YES please"). Treating that as
+    # False silently flips a default-True answer, so ask again instead.
+    print("  Please answer yes or no.")
+    return _prompt_bool(msg, default)
 
 
 def _prompt_int(msg: str, default: int = 0) -> int:
@@ -320,9 +328,12 @@ class SetupWizard:
         )
         sharing_config: dict = {"enabled": False}
         if sharing_enabled:
+            # "nacos" must be offered: _infer_existing_sharing_backend echoes
+            # whatever is already stored, and an existing nacos config that is
+            # not in the choice list makes _prompt_choice loop forever.
             sharing_backend = _prompt_choice(
                 "Storage backend",
-                ["local", "s3", "oss"],
+                ["local", "s3", "oss", "nacos"],
                 default=_infer_existing_sharing_backend(current_sharing),
             )
             group_id = _prompt(
@@ -362,6 +373,32 @@ class SetupWizard:
                     default=current_sharing.get("local_root", ""),
                 )
                 sharing_config["local_root"] = local_root
+            elif sharing_backend == "nacos":
+                nacos_server = _prompt(
+                    "Nacos server address",
+                    default=current_sharing.get("nacos_server") or current_sharing.get("endpoint", ""),
+                )
+                sharing_config["nacos_server"] = nacos_server
+                sharing_config["endpoint"] = nacos_server
+                nacos_namespace_id = _prompt(
+                    "Nacos namespace ID (optional)",
+                    default=current_sharing.get("nacos_namespace_id", ""),
+                )
+                if nacos_namespace_id:
+                    sharing_config["nacos_namespace_id"] = nacos_namespace_id
+                nacos_username = _prompt(
+                    "Nacos username (optional)",
+                    default=current_sharing.get("nacos_username", ""),
+                )
+                if nacos_username:
+                    sharing_config["nacos_username"] = nacos_username
+                nacos_password = _prompt(
+                    "Nacos password (optional)",
+                    default=current_sharing.get("nacos_password", ""),
+                    hide=True,
+                )
+                if nacos_password:
+                    sharing_config["nacos_password"] = nacos_password
             else:
                 endpoint = _prompt(
                     "Storage endpoint",
@@ -424,9 +461,15 @@ class SetupWizard:
             llm_api_mode = str(current_llm.get("api_mode", default_api_mode) or default_api_mode)
         else:
             llm_api_mode = default_api_mode
+        # Merge onto whatever is already on disk. The wizard only collects a
+        # handful of sections; saving a dict built from scratch would drop
+        # dashboard, validation, evolve, record, and every other section the
+        # user configured outside this prompt.
         data = {
+            **existing,
             "claw_type": claw_type,
             "llm": {
+                **existing.get("llm", {}),
                 "provider": provider,
                 "model_id": model_id,
                 "api_base": api_base,
@@ -438,6 +481,7 @@ class SetupWizard:
             "openrouter": openrouter_config,
             "proxy": proxy_config,
             "skills": {
+                **existing.get("skills", {}),
                 "enabled": skills_enabled,
                 "dir": skills_dir,
                 "retrieval_mode": current_skills.get("retrieval_mode", "template"),

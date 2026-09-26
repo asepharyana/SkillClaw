@@ -410,7 +410,7 @@ def from_openai_response(
     content_text = _flatten_openai_message_content(message.get("content"))
     raw_tool_calls = message.get("tool_calls")
     tool_calls = raw_tool_calls if isinstance(raw_tool_calls, list) else []
-    finish_reason = choice.get("finish_reason", "stop")
+    finish_reason = choice.get("finish_reason") or "stop"
     stop_reason = "tool_use" if tool_calls else _STOP_REASON_MAP.get(finish_reason, "end_turn")
 
     content_blocks: list[dict[str, Any]] = []
@@ -435,7 +435,7 @@ def from_openai_response(
     usage = openai_resp.get("usage", {})
     usage = usage if isinstance(usage, dict) else {}
     return {
-        "id": openai_resp.get("id", "msg_skillclaw"),
+        "id": openai_resp.get("id") or "msg_skillclaw",
         "type": "message",
         "role": "assistant",
         "model": model,
@@ -459,7 +459,7 @@ async def stream_from_openai_result(
     usage = payload.get("usage", {})
     usage = usage if isinstance(usage, dict) else {}
     anthropic_usage = _anthropic_usage_from_openai_usage(usage)
-    msg_id = payload.get("id", "msg_skillclaw")
+    msg_id = payload.get("id") or "msg_skillclaw"
 
     def sse(event: str, data: dict[str, Any]) -> str:
         return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -494,8 +494,8 @@ async def stream_from_openai_result(
                     "index": index,
                     "content_block": {
                         "type": "tool_use",
-                        "id": block.get("id", f"call_{index}"),
-                        "name": block.get("name", "unknown_tool"),
+                        "id": block.get("id") or f"call_{index}",
+                        "name": block.get("name") or "unknown_tool",
                         "input": {},
                     },
                 },

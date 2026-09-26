@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,12 @@ from skillclaw.skill_bundle import (
 from ..core.utils import parse_skill_content
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_filename(raw: str) -> str:
+    """Reduce an arbitrary identifier to a single safe path segment."""
+    name = re.sub(r"[^A-Za-z0-9_.-]", "-", str(raw)).strip("-.")
+    return name or "unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -163,7 +170,14 @@ class AgentWorkspace:
                 "_trajectory": s.get("_trajectory", ""),
                 "_summary": s.get("_summary", ""),
             }
-            path = self.sessions_dir / f"{sid}.json"
+            # session_id comes from object storage, so it is untrusted input.
+            # Used raw as a filename, "../../x" or "/etc/x" writes outside the
+            # workspace. Slug it, and confirm the result stayed inside.
+            safe_sid = _safe_filename(str(s.get("session_id", "unknown") or "unknown"))
+            path = self.sessions_dir / f"{safe_sid}.json"
+            if path.parent != self.sessions_dir:
+                logger.warning("[AgentWorkspace] refusing unsafe session id %r", sid)
+                continue
             path.write_text(json.dumps(compact, ensure_ascii=False, indent=2), encoding="utf-8")
 
         # Write existing skills

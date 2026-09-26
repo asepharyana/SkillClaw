@@ -69,7 +69,10 @@ class ValidationWorker:
             prm_model=prm_model,
             api_key=prm_api_key,
             prm_m=max(1, int(getattr(config, "prm_m", 1) or 1)),
-            temperature=float(getattr(config, "prm_temperature", 0.1) or 0.1),
+            # `or 0.1` would rewrite an explicitly configured temperature of 0
+            # back to 0.1; SkillClawConfig always carries the field, so read it
+            # directly. Same fix as config_store's prm.temperature handling.
+            temperature=float(getattr(config, "prm_temperature", 0.6)),
             max_new_tokens=int(getattr(config, "prm_max_new_tokens", 512) or 512),
         )
         self._user_alias = str(config.sharing_user_alias or os.environ.get("USER", "anonymous"))
