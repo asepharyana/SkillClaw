@@ -24,3 +24,16 @@ def resolve_hermes_home() -> Path:
     if raw and raw.strip():
         return Path(raw.strip()).expanduser()
     return Path.home() / ".hermes"
+
+
+def resolve_hermes_config() -> Path:
+    """Resolve the Hermes config file.
+
+    Order:
+      1. HERMES_CONFIG (explicit file path, wins)
+      2. <resolved home>/config.yaml
+    """
+    raw = os.environ.get("HERMES_CONFIG", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return resolve_hermes_home() / "config.yaml"
