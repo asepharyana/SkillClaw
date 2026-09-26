@@ -57,6 +57,20 @@ class SkillClawConfig:
     record_enabled: bool = True
     record_dir: str = "records/"
 
+    # ------------------------------------------------------------------ #
+    # Session lifecycle                                                   #
+    # ------------------------------------------------------------------ #
+    # Close a session after this long without a request. 0 disables the sweeper.
+    session_idle_close_seconds: int = 180
+    # How often the idle sweeper runs.
+    session_sweep_interval_seconds: int = 15
+    # How long shutdown waits for pending session uploads before giving up.
+    shutdown_drain_timeout_seconds: int = 15
+    # Upper bound on remembered previous_response_id entries.
+    responses_store_max_entries: int = 512
+    # How long a stored response stays resumable.
+    responses_store_ttl_seconds: float = 3600.0
+
     # Which CLI agent to auto-configure on startup.
     claw_type: str = "openclaw"
     configure_openclaw: bool = True

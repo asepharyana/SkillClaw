@@ -454,6 +454,28 @@ class ConfigStore:
             proxy_api_key=str(proxy.get("api_key", "") or ""),
             record_enabled=bool(record.get("enabled", True)),
             record_dir=str(record.get("dir", "records/") or "records/"),
+            # Session lifecycle knobs. These used to be read with getattr()
+            # against fields the dataclass never declared, so operator config
+            # was silently ignored and the hard-coded defaults always won.
+            session_idle_close_seconds=_as_int(
+                _first_non_empty(proxy, "session_idle_close_seconds", "idle_close_seconds"),
+                180,
+            ),
+            session_sweep_interval_seconds=_as_int(
+                _first_non_empty(proxy, "session_sweep_interval_seconds", "sweep_interval_seconds"),
+                15,
+            ),
+            shutdown_drain_timeout_seconds=_as_int(
+                _first_non_empty(proxy, "shutdown_drain_timeout_seconds", "drain_timeout_seconds"),
+                15,
+            ),
+            responses_store_max_entries=_as_int(
+                _first_non_empty(proxy, "responses_store_max_entries"),
+                512,
+            ),
+            responses_store_ttl_seconds=float(
+                _as_int(_first_non_empty(proxy, "responses_store_ttl_seconds"), 3600) or 3600
+            ),
             served_model_name=(
                 _first_non_empty(proxy, "served_model_name") or _default_served_model_name(llm_model_id)
             ),

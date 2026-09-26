@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import codecs
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -19,7 +21,7 @@ import re
 import struct
 import threading
 import time
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from typing import Any, Optional
 
@@ -60,6 +62,17 @@ _OPENAI_COMPAT_MAX_COMPLETION_TOKENS = 8192
 _MIN_PROMPT_TOKENS = 1024
 _PROTOCOL_ANTHROPIC_MESSAGES = "anthropic_messages"
 _PROTOCOL_RESPONSES_COMPAT = "responses_compat"
+
+# Bounds for the previous_response_id continuation store. It used to grow for
+# the process lifetime, holding a full message list per turn, so a long-running
+# proxy leaked memory in proportion to prompt size times turn count.
+_RESPONSES_STORE_MAX_ENTRIES = 512
+_RESPONSES_STORE_TTL_SECONDS = 3600.0
+# Recently closed session ids, kept so a late request cannot resurrect a
+# session's store entries. Bounded: ids are cheap and only needed to sweep.
+_CLOSED_SESSION_MEMORY = 1024
+# Bound on remembered pseudo-sessions for clients that send no session id.
+_TUI_SESSION_MAX_ENTRIES = 512
 
 
 # ------------------------------------------------------------------ #
@@ -254,6 +267,33 @@ def _coerce_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _is_retryable_status(status_code: int) -> bool:
+    """Whether a failed upstream call is worth sending again.
+
+    Only transient conditions qualify: a retryable status, or a transport-level
+    failure. A 400/401/403/404/409/422 is deterministic — the same body will be
+    rejected again — so retrying it just multiplies latency and rejected
+    requests. 408 and 429 are the client-error statuses that do clear on their
+    own, and 5xx is the usual transient server class.
+    """
+    return status_code in {408, 429} or 500 <= status_code < 600
+
+
+def _retry_after_seconds(response: Any, fallback: float) -> float:
+    """Honour a ``Retry-After`` header, falling back to exponential backoff."""
+    raw = None
+    try:
+        raw = response.headers.get("Retry-After")
+    except Exception:
+        raw = None
+    if raw is not None:
+        try:
+            return max(0.0, min(float(str(raw).strip()), 60.0))
+        except (TypeError, ValueError):
+            pass
+    return fallback
 
 
 def _llm_request_timeout_seconds() -> float:
@@ -631,38 +671,70 @@ def _restore_missing_reasoning_content(
     if not assistant_tool_indices or not prior_tool_turns:
         return 0
 
-    restored = 0
-    for msg_idx, turn in zip(reversed(assistant_tool_indices), reversed(prior_tool_turns)):
-        msg = messages[msg_idx]
-        if msg.get("reasoning_content"):
-            continue
+    # Pair by tool_call id, not by position: zipping two reversed lists
+    # mis-attributed every reasoning block when the request carried more
+    # assistant tool-call messages than the proxy had recorded, so one call's
+    # chain-of-thought was sent with a different call and the real one dropped.
+    turns_by_id: dict[str, list[dict[str, Any]]] = {}
+    for turn in prior_tool_turns:
         reasoning = str(turn.get("reasoning_content") or "").strip()
         if not reasoning:
             continue
-        messages[msg_idx] = {**msg, "reasoning_content": reasoning}
-        restored += 1
+        for call_id in _turn_tool_call_ids(turn):
+            turns_by_id.setdefault(call_id, []).append(turn)
+
+    restored = 0
+    used: set[int] = set()
+    for msg_idx in reversed(assistant_tool_indices):
+        msg = messages[msg_idx]
+        if msg.get("reasoning_content"):
+            continue
+        for call_id in _message_tool_call_ids(msg):
+            candidates = turns_by_id.get(call_id) or []
+            turn = next((t for t in candidates if id(t) not in used), None)
+            if turn is None:
+                continue
+            used.add(id(turn))
+            messages[msg_idx] = {**msg, "reasoning_content": str(turn["reasoning_content"]).strip()}
+            restored += 1
+            break
     return restored
+
+
+def _turn_tool_call_ids(turn: dict[str, Any]) -> list[str]:
+    """Tool-call ids recorded on a session turn."""
+    ids: list[str] = []
+    raw = turn.get("tool_calls")
+    if isinstance(raw, list):
+        for call in raw:
+            if isinstance(call, dict):
+                call_id = str(call.get("id") or call.get("tool_call_id") or "").strip()
+                if call_id:
+                    ids.append(call_id)
+    single = str(turn.get("tool_call_id") or "").strip()
+    if single:
+        ids.append(single)
+    return ids
 
 
 def _deduplicate_tool_calls(tool_calls: list[dict]) -> list[dict]:
     """Deduplicate tool calls while preserving order.
 
-    Priority key is tool-call id. When id is missing, fallback to
-    (function.name, function.arguments).
+    Only an explicit id identifies a duplicate. Falling back to
+    (name, arguments) merged two genuinely distinct parallel calls that a
+    provider emitted without ids — Hermes' own text-parsed tool calls
+    (``call_kimi_N``/``call_xml_N``) and several upstreams do omit them.
     """
     deduped: list[dict] = []
-    seen: set[str] = set()
+    seen_ids: set[str] = set()
     for tc in tool_calls:
         if not isinstance(tc, dict):
             continue
         tc_id = str(tc.get("id") or "").strip()
-        func = tc.get("function") or {}
-        fn_name = str(func.get("name") or "")
-        fn_args = str(func.get("arguments") or "")
-        key = f"id:{tc_id}" if tc_id else f"fn:{fn_name}|args:{fn_args}"
-        if key in seen:
-            continue
-        seen.add(key)
+        if tc_id:
+            if tc_id in seen_ids:
+                continue
+            seen_ids.add(tc_id)
         deduped.append(tc)
     return deduped
 
@@ -828,7 +900,7 @@ def _assemble_streaming_chat_completion(
         for choice in event.get("choices", []) or []:
             if not isinstance(choice, dict):
                 continue
-            index = int(choice.get("index", 0))
+            index = _coerce_int(choice.get("index"), 0)
             entry = builders.setdefault(
                 index,
                 {
@@ -853,7 +925,9 @@ def _assemble_streaming_chat_completion(
             for tc in delta.get("tool_calls", []) or []:
                 if not isinstance(tc, dict):
                     continue
-                tc_index = int(tc.get("index", 0))
+                # A provider may serialise an explicit `index: null`; int(None)
+                # used to raise and turn the whole request into a 502.
+                tc_index = _coerce_int(tc.get("index"), 0)
                 tool_entry = entry["tool_calls"].setdefault(
                     tc_index,
                     {
@@ -910,8 +984,55 @@ def _assemble_streaming_chat_completion(
     }
 
 
+class _SseStreamError(Exception):
+    """An error frame arrived inside an otherwise-healthy SSE stream.
+
+    OpenAI-compatible streams can report a mid-generation failure as a
+    ``data: {"error": {...}}`` frame and then close. Treating the partial text
+    as a normal completion reports a truncated answer as a success, so this is
+    raised instead of letting the assembler finish silently.
+    """
+
+    def __init__(self, message: str, code: str = "upstream_error"):
+        super().__init__(message)
+        self.message = message
+        self.code = code
+
+
+def _stream_error_event(error: Exception, response_id: str = "", model: str = "") -> dict[str, Any]:
+    """Build a client-facing error frame for an already-started SSE stream."""
+    message = str(error) or error.__class__.__name__
+    code = getattr(error, "code", "upstream_error")
+    if getattr(error, "status_code", None) is not None:
+        detail: dict[str, Any] = f"Upstream LLM error: {error}"
+    else:
+        detail = {"message": message, "type": "upstream_error", "code": code}
+    return {
+        "error": {
+            "message": message,
+            "type": "upstream_error",
+            "code": code,
+            "param": None,
+            "detail": detail,
+        },
+        "id": response_id,
+        "object": "chat.completion.chunk",
+        "model": model,
+    }
+
+
+def _sse_chunk(payload: dict[str, Any]) -> str:
+    """Serialize one SSE data frame."""
+    return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+
 async def _collect_sse_chat_events(response) -> list[dict[str, Any]]:
-    """Read SSE `data:` lines from a streaming chat completion response."""
+    """Read SSE `data:` lines from a streaming chat completion response.
+
+    Raises :class:`_SseStreamError` when a frame carries an ``error`` object
+    so the caller can fail the request instead of returning a partial answer
+    as a normal completion.
+    """
     events: list[dict[str, Any]] = []
     async for line in response.aiter_lines():
         if not line:
@@ -925,8 +1046,17 @@ async def _collect_sse_chat_events(response) -> list[dict[str, Any]]:
             event = json.loads(payload)
         except json.JSONDecodeError:
             continue
-        if isinstance(event, dict):
-            events.append(event)
+        if not isinstance(event, dict):
+            continue
+        if isinstance(event.get("error"), (dict, str)):
+            error = event["error"]
+            if isinstance(error, dict):
+                message = str(error.get("message") or json.dumps(error, ensure_ascii=False)[:200])
+                code = str(error.get("code") or error.get("type") or "upstream_error")
+            else:
+                message, code = str(error), "upstream_error"
+            raise _SseStreamError(message, code)
+        events.append(event)
     return events
 
 
@@ -1308,6 +1438,11 @@ def _estimate_image_content_tokens(content: Any) -> int:
     return 0
 
 
+def _system_prompt_fingerprint(prompt: str) -> str:
+    """Stable id for the raw system prompt a compression was derived from."""
+    return hashlib.sha256(prompt.encode("utf-8", errors="replace")).hexdigest()
+
+
 def _token_estimate_text(content: Any) -> str:
     if isinstance(content, str):
         return content
@@ -1331,12 +1466,62 @@ def _token_estimate_text(content: Any) -> str:
     return str(content) if content is not None else ""
 
 
-def _estimate_openai_body_input_tokens(openai_body: dict[str, Any]) -> int:
-    """Return a provider-agnostic rough input token estimate.
+_TOKEN_ESTIMATOR: Any = None
+_TOKEN_ESTIMATOR_TRIED = False
+# A full conversation can be megabytes; encoding all of it on every truncation
+# probe is wasteful, so long strings fall back to the cheap heuristic.
+_TOKENIZER_MAX_CHARS = 200_000
 
-    SkillClaw proxies external agents and does not own the upstream model's
-    exact tokenization. Keep this estimate local and dependency-free so
-    daemon readiness never depends on model-specific tokenization.
+
+def _count_tokens_with_tiktoken(text: str) -> int | None:
+    """Count tokens with tiktoken, or return None when unavailable.
+
+    Loading the BPE table costs time and may need a network fetch, so it is
+    attempted once per process and every failure path degrades to the
+    character heuristic instead of breaking truncation.
+    """
+    global _TOKEN_ESTIMATOR, _TOKEN_ESTIMATOR_TRIED
+    if len(text) > _TOKENIZER_MAX_CHARS:
+        return None
+    if _TOKEN_ESTIMATOR is None and not _TOKEN_ESTIMATOR_TRIED:
+        _TOKEN_ESTIMATOR_TRIED = True
+        try:
+            import tiktoken
+
+            _TOKEN_ESTIMATOR = tiktoken.get_encoding("o200k_base")
+        except Exception as e:  # pragma: no cover - depends on local install
+            logger.info("[OpenClaw] tiktoken unavailable for token estimation (%s); using heuristic", e)
+            _TOKEN_ESTIMATOR = None
+    if _TOKEN_ESTIMATOR is None:
+        return None
+    try:
+        return len(_TOKEN_ESTIMATOR.encode(text, disallowed_special=()))
+    except Exception:
+        return None
+
+
+def _estimate_text_tokens(text: str) -> int:
+    """Estimate tokens for a text blob.
+
+    ``len(text) / 4`` assumes ASCII, where it errs on the safe side. It badly
+    under-counts CJK and emoji (measured 0.44x and 0.25x of the real o200k
+    count), which made truncation stop too early and forward an over-limit
+    prompt. Prefer a real tokenizer and keep the heuristic as the fallback.
+    """
+    if not text:
+        return 0
+    counted = _count_tokens_with_tiktoken(text)
+    if counted is not None:
+        return counted
+    return max(1, (len(text) + 3) // 4)
+
+
+def _estimate_openai_body_input_tokens(openai_body: dict[str, Any]) -> int:
+    """Return a provider-agnostic estimate of the prompt's input tokens.
+
+    tiktoken is already a runtime dependency and is used here when available;
+    the character heuristic remains the fallback so truncation stays active in
+    any environment where the BPE table cannot be loaded.
     """
     messages = list(openai_body.get("messages") or [])
     tools = openai_body.get("tools")
@@ -1344,6 +1529,8 @@ def _estimate_openai_body_input_tokens(openai_body: dict[str, Any]) -> int:
     text_parts = []
     for msg in messages:
         if not isinstance(msg, dict):
+            # A client may POST a bare string as a message; it still costs tokens.
+            text_parts.append(str(msg))
             continue
         text_parts.append(f"{msg.get('role', '')}: {_token_estimate_text(msg.get('content'))}")
         if msg.get("tool_calls"):
@@ -1351,7 +1538,7 @@ def _estimate_openai_body_input_tokens(openai_body: dict[str, Any]) -> int:
     if tools:
         text_parts.append(json.dumps(tools, ensure_ascii=False, sort_keys=True))
     text = "\n".join(part for part in text_parts if part)
-    return max(1, (len(text) + 3) // 4 + image_tokens)
+    return max(1, _estimate_text_tokens(text) + image_tokens)
 
 
 def _message_identity(message: dict[str, Any]) -> str:
@@ -1563,12 +1750,304 @@ def _message_drop_units(messages: list[dict]) -> list[list[int]]:
     return units
 
 
+def _merge_responses_item(payload: dict[str, Any], item: dict[str, Any]) -> None:
+    """Add an output item to a Responses payload that omitted it."""
+    output = payload.setdefault("output", [])
+    if not isinstance(output, list):
+        payload["output"] = output = []
+    key = str(item.get("id") or item.get("call_id") or "")
+    for existing in output:
+        if isinstance(existing, dict) and key and str(existing.get("id") or existing.get("call_id") or "") == key:
+            return
+    output.append(item)
+
+
+def _responses_finish_reason(payload: dict[str, Any]) -> str:
+    """Map a Responses terminal status onto a chat ``finish_reason``."""
+    if str(payload.get("status") or "") == "incomplete":
+        details = payload.get("incomplete_details")
+        reason = str(details.get("reason") or "") if isinstance(details, dict) else ""
+        return "length" if reason == "max_output_tokens" else "stop"
+    return "stop"
+
+
+def _chat_tools_to_responses(tools: list[Any]) -> list[dict[str, Any]]:
+    """Translate chat ``tools`` into Responses ``tools``.
+
+    Both surfaces use a flat ``{"type": "function", ...}`` list, so the shape is
+    preserved; only non-function tool types (which Responses does not accept
+    the same way) are filtered out rather than forwarded blindly.
+    """
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if str(tool.get("type") or "function") != "function":
+            continue
+        converted.append(tool)
+    return converted
+
+
+def _tui_client_discriminator(client_key: str) -> str:
+    """Derive a short, stable id identifying the calling client.
+
+    Clients that omit X-Session-Id used to share one pseudo-session per model,
+    so two agents' turns interleaved. Hashing whatever identity the request
+    carries (auth header, user-agent, remote peer) keeps them apart without
+    trusting the value as a path or key.
+    """
+    raw = (client_key or "").strip()
+    if not raw:
+        return ""
+    return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:12]
+
+
+def _responses_item_user_turn(item: Any) -> bool:
+    """Whether a Responses input item is a user turn."""
+    if not isinstance(item, dict):
+        return False
+    if item.get("type") in {None, "message"} and item.get("role") == "user":
+        return True
+    return False
+
+
+def _responses_item_group_key(item: Any) -> str:
+    """Group key tying a function_call_output back to its function_call."""
+    if not isinstance(item, dict):
+        return ""
+    if item.get("type") in {"function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output"}:
+        return str(item.get("call_id") or item.get("id") or "")
+    return ""
+
+
+def _responses_input_drop_units(items: list[Any]) -> list[list[int]]:
+    """Group Responses input indices into units that drop together.
+
+    A ``function_call`` and the ``function_call_output`` answering it are one
+    unit: a Responses upstream rejects an output with no matching call, and a
+    call with no output, both with 400 invalid_request_error.
+    """
+    units: list[list[int]] = []
+    pending: dict[str, list[int]] = {}
+    for index, item in enumerate(items):
+        key = _responses_item_group_key(item)
+        if not key:
+            units.append([index])
+            continue
+        if isinstance(item, dict) and item.get("type") in {"function_call_output", "custom_tool_call_output"}:
+            issued = pending.pop(key, None)
+            if issued:
+                issued.append(index)
+                units.append(issued)
+                continue
+            units.append([index])
+            continue
+        if key in pending:
+            pending[key].append(index)
+        else:
+            pending[key] = [index]
+            units.append(pending[key])
+    for orphan in pending.values():
+        # An unanswered call is still a unit of its own; already in units.
+        if not any(unit and unit[-1] == orphan[-1] for unit in units):
+            units.append(list(orphan))
+    return units
+
+
+def _drop_oldest_response_units(items: list[Any], units: list[list[int]], count: int) -> list[Any]:
+    dropped: set[int] = set()
+    for unit in units[:count]:
+        dropped.update(unit)
+    return [item for i, item in enumerate(items) if i not in dropped]
+
+
+def _truncate_responses_input(items: list[Any], max_prompt_tokens: int) -> list[Any]:
+    """Trim a native Responses ``input`` list to fit the context budget.
+
+    The native path had no truncation at all, so a long Codex conversation was
+    forwarded verbatim and came back as an upstream 400. This mirrors the chat
+    path: keep the newest item, drop whole tool groups oldest-first, and never
+    settle on a cut with no user turn.
+    """
+    if max_prompt_tokens <= 0 or not isinstance(items, list) or not items:
+        return items
+
+    def _len(candidate: list[Any]) -> int:
+        return _estimate_text_tokens(_token_estimate_text(candidate))
+
+    original = _len(items)
+    if original <= max_prompt_tokens:
+        return items
+
+    # A bare string input is a single user turn; leave it untouched.
+    if any(not isinstance(item, dict) for item in items):
+        return items
+
+    units = _responses_input_drop_units(items)
+    dropped = 0
+    for step in range(1, len(units)):
+        candidate = _drop_oldest_response_units(items, units, step)
+        if not candidate:
+            break
+        dropped = step
+        if any(_responses_item_user_turn(item) for item in candidate) and _len(candidate) <= max_prompt_tokens:
+            break
+
+    result = _drop_oldest_response_units(items, units, dropped)
+    if not any(_responses_item_user_turn(item) for item in result):
+        for step in range(len(units), dropped, -1):
+            candidate = _drop_oldest_response_units(items, units, step)
+            if candidate and any(_responses_item_user_turn(item) for item in candidate):
+                dropped = step
+                result = candidate
+                break
+    result_tokens = _len(result)
+    if dropped:
+        logger.info(
+            "[OpenClaw] Responses input truncated: dropped %d oldest items (%d -> %d est tokens, limit=%d)",
+            dropped,
+            original,
+            result_tokens,
+            max_prompt_tokens,
+        )
+    return result
+
+
+def _has_user_turn(messages: list[Any]) -> bool:
+    """Whether a message list still carries a user turn.
+
+    OpenAI-compatible upstreams reject a conversation with no user turn, so
+    truncation must never settle on a cut that removes all of them.
+    """
+    return any(isinstance(m, dict) and m.get("role") == "user" for m in messages)
+
+
 def _drop_oldest_units(messages: list[dict], units: list[list[int]], count: int) -> list[dict]:
     """Drop the ``count`` oldest units, keeping the rest in order."""
     dropped: set[int] = set()
     for unit in units[:count]:
         dropped.update(unit)
     return [m for i, m in enumerate(messages) if i not in dropped]
+
+
+def _sanitize_forward_messages(messages: list[Any]) -> list[Any]:
+    """Make a message list acceptable to OpenAI-compatible upstreams.
+
+    This is the single choke point for every inbound protocol (chat, Anthropic
+    Messages, Responses), so the three shapes that upstreams reject with a
+    deterministic ``400 invalid_request_error`` are fixed once:
+
+    1. a ``role:tool`` result whose issuing assistant turn is absent, or whose
+       ``tool_call_id`` is empty (an Anthropic ``tool_result`` block with no
+       ``tool_use_id``);
+    2. a conversation that ends on an unanswered assistant ``tool_calls``;
+    3. a conversation with no ``user`` turn at all.
+
+    Fixing them here rather than per-protocol matters because the rejected
+    request was previously retried as if it were a transient failure, turning a
+    client bug into ~33s of latency and a 502.
+    """
+    if not isinstance(messages, list) or not messages:
+        return messages
+
+    # 1. Drop tool results with no id or no issuer anywhere in the request.
+    issued: set[str] = set()
+    for message in messages:
+        if isinstance(message, dict):
+            issued |= _message_tool_call_ids(message)
+
+    kept: list[Any] = []
+    dropped_orphans = 0
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "tool":
+            call_id = str(message.get("tool_call_id") or "").strip()
+            if not call_id or call_id not in issued:
+                dropped_orphans += 1
+                continue
+        kept.append(message)
+    if dropped_orphans:
+        logger.info("[OpenClaw] dropped %d orphan tool result(s) before forwarding", dropped_orphans)
+
+    # A tool result must follow the assistant turn that issued it. Reorder
+    # defensively: an upstream reads positionally, not by id lookup.
+    kept = _hoist_tool_results_after_assistant(kept)
+
+    # 2. An unanswered trailing tool_call is rejected. Synthesize the missing
+    #    result rather than dropping the call, so the client still sees the
+    #    tool the model asked for and can answer it next turn.
+    if kept and isinstance(kept[-1], dict) and _assistant_message_has_tool_calls(kept[-1]):
+        pending = [
+            str(call.get("id") or "")
+            for call in (kept[-1].get("tool_calls") or [])
+            if isinstance(call, dict) and call.get("id")
+        ]
+        answered = {
+            str(m.get("tool_call_id") or "")
+            for m in kept
+            if isinstance(m, dict) and m.get("role") == "tool"
+        }
+        for call_id in pending:
+            if call_id in answered:
+                continue
+            kept.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": "[tool result unavailable: client ended the turn without calling this tool]",
+                }
+            )
+
+    # 3. Guarantee a user turn so the request is never conversation-less.
+    if not _has_user_turn(kept):
+        logger.info("[OpenClaw] injected a placeholder user turn: request had none")
+        kept.append({"role": "user", "content": "Continue."})
+    return kept
+
+
+def _hoist_tool_results_after_assistant(messages: list[Any]) -> list[Any]:
+    """Move each ``role:tool`` message directly after its issuing assistant."""
+    out: list[Any] = []
+    pending: dict[str, list[Any]] = {}
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "tool":
+            call_id = str(message.get("tool_call_id") or "").strip()
+            pending.setdefault(call_id, []).append(message)
+            continue
+        out.append(message)
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                call_id = str(call.get("id") or "").strip()
+                waiting = pending.pop(call_id, None)
+                if waiting:
+                    out.extend(waiting)
+    # Anything still waiting had no issuer; drop it rather than reorder blindly.
+    return out
+
+
+def _repair_orphan_tool_results(messages: list[dict]) -> list[dict]:
+    """Drop ``role:tool`` results whose issuing assistant turn is gone.
+
+    Truncation normally keeps tool rounds whole, but a client can hand us a
+    result whose assistant turn is not in the request at all, and truncation
+    can split a round when a result is separated from its issuer by a user
+    turn. Either way the forwarded body would contain an orphan tool message,
+    which OpenAI-compatible upstreams reject with 400 invalid_request_error.
+    """
+    issued: set[str] = set()
+    for message in messages:
+        if isinstance(message, dict):
+            issued |= _message_tool_call_ids(message)
+    repaired: list[dict] = []
+    for message in messages:
+        if isinstance(message, dict) and message.get("role") == "tool":
+            call_id = str(message.get("tool_call_id") or "")
+            if call_id and call_id not in issued:
+                logger.info("[OpenClaw] dropping orphan tool result %s during truncation", call_id)
+                continue
+        repaired.append(message)
+    return repaired
 
 
 class SkillClawAPIServer:
@@ -1627,19 +2106,33 @@ class SkillClawAPIServer:
         self._closing_sessions: set[str] = set()  # session ids currently being closed
         self._background_tasks: set[asyncio.Task] = set()  # transient async tasks (upload, submit)
         self._responses_store: dict[str, dict[str, Any]] = {}  # response_id -> stored response/history
+        self._response_id_by_session: dict[str, set[str]] = {}  # session -> owned response ids
+        self._closed_session_ids: set[str] = set()  # recently closed sessions, for store sweeping
+        self._in_flight_sessions: set[str] = set()  # sessions with a request currently running
         self._session_sweeper_task: Optional[asyncio.Task] = None
         self._skill_reload_task: Optional[asyncio.Task] = None
+        # Read from the dataclass directly: these fields now exist, so an
+        # operator's config.yaml value is honoured instead of being discarded
+        # in favour of a hard-coded default.
         self._session_idle_close_seconds = max(
             0,
-            int(getattr(config, "session_idle_close_seconds", _SESSION_IDLE_CLOSE_SECONDS)),
+            _coerce_int(getattr(config, "session_idle_close_seconds", None), _SESSION_IDLE_CLOSE_SECONDS),
         )
         self._session_sweep_interval_seconds = max(
             1,
-            int(getattr(config, "session_sweep_interval_seconds", _SESSION_SWEEP_INTERVAL_SECONDS)),
+            _coerce_int(getattr(config, "session_sweep_interval_seconds", None), _SESSION_SWEEP_INTERVAL_SECONDS),
         )
         self._shutdown_drain_timeout_seconds = max(
             1,
-            int(getattr(config, "shutdown_drain_timeout_seconds", _SHUTDOWN_DRAIN_TIMEOUT_SECONDS)),
+            _coerce_int(getattr(config, "shutdown_drain_timeout_seconds", None), _SHUTDOWN_DRAIN_TIMEOUT_SECONDS),
+        )
+        self._responses_store_max_entries = max(
+            1,
+            _coerce_int(getattr(config, "responses_store_max_entries", None), _RESPONSES_STORE_MAX_ENTRIES),
+        )
+        self._responses_store_ttl_seconds = max(
+            1.0,
+            float(getattr(config, "responses_store_ttl_seconds", None) or _RESPONSES_STORE_TTL_SECONDS),
         )
         self._skill_reload_interval_seconds = max(
             5,
@@ -1647,8 +2140,12 @@ class SkillClawAPIServer:
         )
 
         # Session boundary detection for non-OpenClaw agents (QwenPaw, IronClaw, etc.)
-        # Maps pseudo-session key (e.g. "tui-model") to tracking metadata.
+        # Maps pseudo-session key (e.g. "tui-<client>-<model>") to tracking metadata.
         self._tui_session_meta: dict[str, dict] = {}
+        # Stable per-client discriminator so two agents on the same model do not
+        # collapse into one pseudo-session. Replaced by the first request's
+        # client identity; falls back to a per-process constant.
+        self._tui_client_id = os.environ.get("SKILLCLAW_CLIENT_ID", "").strip() or f"p{os.getpid()}x"
         _INACTIVITY_TIMEOUT = 300  # seconds — treat as new session after 5 min idle
         self._tui_inactivity_timeout = _INACTIVITY_TIMEOUT
 
@@ -1761,6 +2258,7 @@ class SkillClawAPIServer:
                 session_id = await owner._resolve_tui_session(
                     body.get("model", "default"),
                     msg_count,
+                    owner._tui_client_key(request, authorization),
                 )
                 turn_type = _resolve_turn_type(x_turn_type, body.get("turn_type"), default="main")
             session_done = _resolve_session_done(x_session_done, body.get("session_done"))
@@ -1827,30 +2325,27 @@ class SkillClawAPIServer:
 
             previous_response_id = str(body.get("previous_response_id") or "").strip()
             store_response = bool(body.get("store", True))
-            openai_body = _responses_to_openai_body(body, owner._served_model)
-            openai_body["_skillclaw_protocol"] = _PROTOCOL_RESPONSES_COMPAT
-            if previous_response_id:
-                stored = owner._responses_store.get(previous_response_id)
-                if stored is None:
-                    raise HTTPException(
-                        status_code=404,
-                        detail=f"previous_response_id not found: {previous_response_id}",
-                    )
-                openai_body["messages"] = _merge_previous_response_messages(
-                    list(stored.get("messages") or []),
-                    list(openai_body.get("messages") or []),
-                )
             _raw_sid = x_session_id or codex_session_id or body.get("session_id") or ""
             if _raw_sid:
                 session_id = _raw_sid
                 turn_type = _resolve_turn_type(x_turn_type, body.get("turn_type"), default="main")
             else:
-                msg_count = len(openai_body.get("messages") or [])
+                msg_count = len(body.get("input", []) if isinstance(body.get("input"), list) else [])
                 session_id = await owner._resolve_tui_session(
-                    openai_body.get("model", owner._served_model),
+                    body.get("model", owner._served_model),
                     msg_count,
+                    owner._tui_client_key(request, authorization),
                 )
                 turn_type = _resolve_turn_type(x_turn_type, body.get("turn_type"), default="main")
+
+            openai_body = _responses_to_openai_body(body, owner._served_model)
+            openai_body["_skillclaw_protocol"] = _PROTOCOL_RESPONSES_COMPAT
+            if previous_response_id:
+                stored = owner._get_stored_response(previous_response_id, session_id)
+                openai_body["messages"] = _merge_previous_response_messages(
+                    list(stored.get("messages") or []),
+                    list(openai_body.get("messages") or []),
+                )
             session_done = _resolve_session_done(x_session_done, body.get("session_done"))
 
             result = await owner._handle_request(
@@ -1863,19 +2358,33 @@ class SkillClawAPIServer:
                 result["response"],
                 model=openai_body.get("model", owner._served_model),
             )
-            assistant_message = (
-                result.get("response", {}).get("choices", [{}])[0].get("message", {})
-                if isinstance(result.get("response"), dict)
-                else {}
-            )
+            # The proxy id is derived from the upstream chat id, which can repeat
+            # across turns. Two turns then collided on one key and the second
+            # write clobbered the first, so a client resuming turn 1 by id got
+            # turn 2's history.
+            response_payload = {
+                **response_payload,
+                "id": owner._unique_response_id(response_payload.get("id")),
+            }
+            choices = result.get("response", {}).get("choices") or [{}]
+            first_choice = choices[0] if isinstance(choices[0], dict) else {}
+            assistant_message = first_choice.get("message") or {}
+            if not isinstance(assistant_message, dict) or not assistant_message.get("role"):
+                # Storing a roleless fragment made the next turn replay a
+                # message that no upstream would accept.
+                assistant_message = {"role": "assistant", "content": ""}
             if store_response:
-                owner._responses_store[response_payload["id"]] = {
-                    "response": response_payload,
-                    "messages": [
-                        *list(openai_body.get("messages") or []),
-                        assistant_message if isinstance(assistant_message, dict) else {},
+                # Store what was actually forwarded, not the pre-truncation
+                # list: replaying the full history re-inflated a prompt the
+                # proxy had just deliberately trimmed.
+                owner._store_response(
+                    response_payload,
+                    messages=[
+                        *list(result.get("forwarded_messages") or openai_body.get("messages") or []),
+                        assistant_message,
                     ],
-                }
+                    session_id=session_id,
+                )
             if bool(body.get("stream", False)):
                 return StreamingResponse(
                     owner._stream_responses_response(response_payload),
@@ -1887,26 +2396,27 @@ class SkillClawAPIServer:
         async def get_response(
             response_id: str,
             request: Request,
-            authorization: Optional[str] = Header(default=None),
+            authorization: str = Header(default=None),
+            x_session_id: Optional[str] = Header(default=None),
         ):
             owner: SkillClawAPIServer = request.app.state.owner
             await owner._check_auth(authorization)
-            stored = owner._responses_store.get(response_id)
-            if stored is None:
-                raise HTTPException(status_code=404, detail="response not found")
+            stored = owner._get_stored_response(response_id, x_session_id)
             return JSONResponse(content=stored["response"])
 
         @app.delete("/v1/responses/{response_id}")
         async def delete_response(
             response_id: str,
             request: Request,
-            authorization: Optional[str] = Header(default=None),
+            authorization: str = Header(default=None),
+            x_session_id: Optional[str] = Header(default=None),
         ):
             owner: SkillClawAPIServer = request.app.state.owner
             await owner._check_auth(authorization)
-            stored = owner._responses_store.pop(response_id, None)
-            if stored is None:
-                raise HTTPException(status_code=404, detail="response not found")
+            # Ownership is checked before the pop so an unauthorised id neither
+            # reveals existence nor destroys another session's entry.
+            owner._get_stored_response(response_id, x_session_id)
+            owner._responses_store.pop(response_id, None)
             return JSONResponse(content={"id": response_id, "object": "response", "deleted": True})
 
         # ---------------------------------------------------------------- #
@@ -2018,10 +2528,112 @@ class SkillClawAPIServer:
         return age >= max(0, int(idle_after_seconds))
 
     # ------------------------------------------------------------------ #
+    # Responses store (previous_response_id continuation)                #
+    # ------------------------------------------------------------------ #
+
+    def _unique_response_id(self, base_id: Any) -> str:
+        """Return a store-unique id derived from the upstream response id.
+
+        The payload id comes from the upstream chat id, which some providers
+        reuse across turns. Keying the store on it made a second turn clobber
+        the first, so a client resuming an earlier turn by id silently received
+        the later turn's history.
+        """
+        base = str(base_id or "").strip() or "resp"
+        candidate = base
+        suffix = 1
+        while candidate in self._responses_store:
+            suffix += 1
+            candidate = f"{base}-{suffix}"
+        return candidate
+
+    def _store_response(self, response_payload: dict[str, Any], *, messages: list, session_id: str) -> None:
+        """Remember a response for ``previous_response_id`` continuation."""
+        response_id = str(response_payload.get("id") or "")
+        if not response_id:
+            return
+        self._prune_responses_store()
+        self._responses_store[response_id] = {
+            "response": response_payload,
+            "messages": messages,
+            "session_id": session_id,
+            "stored_at": time.time(),
+        }
+        self._response_id_by_session.setdefault(session_id, set()).add(response_id)
+        while len(self._responses_store) > self._responses_store_max_entries:
+            oldest = min(
+                self._responses_store.items(),
+                key=lambda item: item[1].get("stored_at", 0.0),
+            )[0]
+            self._discard_response(oldest)
+
+    def _discard_response(self, response_id: str) -> None:
+        stored = self._responses_store.pop(response_id, None)
+        if stored is None:
+            return
+        owner = stored.get("session_id")
+        if owner:
+            ids = self._response_id_by_session.get(owner)
+            if ids:
+                ids.discard(response_id)
+                if not ids:
+                    self._response_id_by_session.pop(owner, None)
+
+    def _prune_responses_store(self) -> None:
+        """Evict expired entries and every entry owned by a closed session."""
+        now = time.time()
+        expired = [
+            response_id
+            for response_id, stored in self._responses_store.items()
+            if now - float(stored.get("stored_at", 0.0)) > self._responses_store_ttl_seconds
+        ]
+        for response_id in expired:
+            self._discard_response(response_id)
+        for session_id in self._closed_session_ids:
+            for response_id in list(self._response_id_by_session.get(session_id, ())):
+                self._discard_response(response_id)
+        if len(self._responses_store) > self._responses_store_max_entries:
+            excess = len(self._responses_store) - self._responses_store_max_entries
+            for response_id in list(self._responses_store)[:excess]:
+                self._discard_response(response_id)
+
+    def _get_stored_response(self, response_id: str, session_id: Optional[str]) -> dict[str, Any]:
+        """Return a stored response, enforcing session ownership.
+
+        Without this check any client that learned (or guessed) a response id
+        could resume another session's conversation and have its private turns
+        forwarded upstream.
+        """
+        self._prune_responses_store()
+        stored = self._responses_store.get(response_id)
+        if stored is None:
+            raise HTTPException(status_code=404, detail=f"response not found: {response_id}")
+        owner = stored.get("session_id")
+        if owner and session_id and owner != session_id:
+            logger.warning(
+                "[OpenClaw] refused cross-session responses lookup: id=%s owner=%s requester=%s",
+                response_id,
+                owner,
+                session_id,
+            )
+            # Same 404 as an unknown id so existence is not disclosed.
+            raise HTTPException(status_code=404, detail=f"response not found: {response_id}")
+        return stored
+
+    def _release_session_responses(self, session_id: str) -> None:
+        """Drop every stored response owned by a closing session."""
+        for response_id in list(self._response_id_by_session.get(session_id, ())):
+            self._discard_response(response_id)
+        self._response_id_by_session.pop(session_id, None)
+        self._closed_session_ids.add(session_id)
+        if len(self._closed_session_ids) > _CLOSED_SESSION_MEMORY:
+            self._closed_session_ids.clear()
+
+    # ------------------------------------------------------------------ #
     # TUI session boundary detection (QwenPaw / IronClaw / generic clients) #
     # ------------------------------------------------------------------ #
 
-    async def _resolve_tui_session(self, model: str, msg_count: int) -> str:
+    async def _resolve_tui_session(self, model: str, msg_count: int, client_key: str = "") -> str:
         """Return a session_id for agents that don't send X-Session-Id.
 
         Detects new-conversation boundaries by two heuristics:
@@ -2033,7 +2645,15 @@ class SkillClawAPIServer:
         """
         import uuid
 
-        tui_key = f"tui-{model}"
+        # The key used to be `tui-{model}` only, so two clients on the same
+        # model shared one pseudo-session: their turns interleaved in
+        # _session_turns and one client's private content was uploaded under
+        # the other's session id. Include the client identity when available,
+        # and bound the map so an attacker cannot grow it with fake model names.
+        client_id = _tui_client_discriminator(client_key) or self._tui_client_id
+        tui_key = f"tui-{client_id}-{model}" if client_id else f"tui-anon-{model}"
+        if len(self._tui_session_meta) > _TUI_SESSION_MAX_ENTRIES:
+            self._tui_session_meta.clear()
         now = time.time()
         meta = self._tui_session_meta.get(tui_key)
 
@@ -2083,18 +2703,66 @@ class SkillClawAPIServer:
         meta["last_request_time"] = now
         return meta["session_id"]
 
+    @staticmethod
+    def _tui_client_key(request: Request, authorization: str) -> str:
+        """Build the per-client discriminator used for pseudo-session keys."""
+        client_host = getattr(getattr(request, "client", None), "host", "") or ""
+        user_agent = request.headers.get("user-agent", "")
+        auth = (authorization or "").strip()
+        # The auth token identifies the caller; host and user-agent separate
+        # distinct local agents that share one credential.
+        return "|".join([auth, client_host, user_agent])
+
     def _touch_session(self, session_id: str) -> None:
         if session_id:
             self._session_last_active[session_id] = time.time()
 
+    def _session_has_pending_work(self, session_id: str) -> bool:
+        """Whether a session still owns state the sweeper must not reclaim."""
+        if session_id in self._in_flight_sessions:
+            return True
+        for mapping in (
+            self._pending_turn_data,
+            self._prm_tasks,
+            self._pending_records,
+            self._session_turns,
+        ):
+            value = mapping.get(session_id)
+            if value:
+                return True
+        return bool(self._turn_counts.get(session_id))
+
+    @contextmanager
+    def _in_flight_request(self, session_id: str):
+        """Mark a request as in-flight so the idle sweeper leaves it alone.
+
+        A long request used to be reaped mid-flight, and its orphaned state was
+        written afterwards without a fresh timestamp, so it could never be
+        swept again.
+        """
+        self._in_flight_sessions.add(session_id)
+        try:
+            yield
+        finally:
+            self._in_flight_sessions.discard(session_id)
+            # Re-arm the idle clock: the request just finished, so the session
+            # must be collectable again once the new threshold elapses.
+            self._touch_session(session_id)
+
     def _collect_active_session_ids(self) -> list[str]:
-        session_ids = set(self._session_last_active.keys())
-        session_ids.update(self._pending_records.keys())
-        session_ids.update(self._session_turns.keys())
-        session_ids.update(self._pending_turn_data.keys())
-        session_ids.update(self._turn_counts.keys())
-        session_ids.update(self._session_scored_turns.keys())
-        session_ids.update(self._prm_tasks.keys())
+        # Only sessions with real pending work count. Unioning dict *keys* kept
+        # a session active after every turn had been finalized, so idle
+        # validation could never run on a proxy that had served any session.
+        session_ids: set[str] = set()
+        for mapping in (
+            self._pending_turn_data,
+            self._prm_tasks,
+            self._pending_records,
+            self._session_turns,
+        ):
+            session_ids.update(sid for sid, value in mapping.items() if value)
+        session_ids.update(sid for sid, count in self._turn_counts.items() if count)
+        session_ids.update(self._in_flight_sessions)
         return sorted(s for s in session_ids if s and s not in self._closing_sessions)
 
     def _collect_idle_session_ids(self, now: Optional[float] = None) -> list[str]:
@@ -2106,7 +2774,11 @@ class SkillClawAPIServer:
         return sorted(
             sid
             for sid, ts in self._session_last_active.items()
-            if sid and sid not in self._closing_sessions and (now - float(ts)) >= threshold
+            if sid
+            and sid not in self._closing_sessions
+            and (now - float(ts)) >= threshold
+            # Never reap a request that is still running upstream.
+            and sid not in self._in_flight_sessions
         )
 
     def _start_session_idle_sweeper(self) -> None:
@@ -2210,11 +2882,21 @@ class SkillClawAPIServer:
         await self._drain_active_sessions(reason="server_shutdown")
         await self._await_background_tasks(self._shutdown_drain_timeout_seconds)
 
+    async def _await_session_close(self, session_id: str) -> None:
+        """Block until any in-flight close of *session_id* has finished."""
+        deadline = time.monotonic() + _SHUTDOWN_DRAIN_TIMEOUT_SECONDS
+        while session_id in self._closing_sessions and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+
     async def _close_session(self, session_id: str, reason: str = "explicit") -> None:
         """Flush a session: finalize pending turn feedback, upload session data, clean up state."""
         if not session_id:
             return
         if session_id in self._closing_sessions:
+            # Wait for the in-flight close instead of returning immediately:
+            # returning let a caller start a new conversation on the same id
+            # whose turns were then wiped and uploaded by the first close.
+            await self._await_session_close(session_id)
             return
         self._closing_sessions.add(session_id)
         try:
@@ -2282,9 +2964,25 @@ class SkillClawAPIServer:
             turns = self._session_turns.pop(session_id, [])
             modified_skill_names = _extract_modified_skill_names(turns)
             if turns and self.config.sharing_enabled:
-                self._safe_create_task(self._upload_session_data(session_id, turns))
+                upload = asyncio.create_task(self._upload_session_data(session_id, turns))
+                upload.add_done_callback(self._task_done_cb)
+                if reason == "server_shutdown":
+                    # A restart faster than the upload used to lose whole
+                    # sessions: the drain cancelled the task and the drained
+                    # state was gone, so there was no retry. Let the last
+                    # session data reach the server before we exit.
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(upload),
+                            timeout=self._shutdown_drain_timeout_seconds,
+                        )
+                    except (asyncio.TimeoutError, Exception) as e:
+                        logger.warning("[SessionDetect] final session upload incomplete for %s: %s", session_id, e)
+                else:
+                    self._background_tasks.add(upload)
             if self.config.sharing_enabled:
                 self._safe_create_task(self._pull_skills_from_cloud(skip_names=modified_skill_names))
+            self._release_session_responses(session_id)
             self._session_last_active.pop(session_id, None)
             for key, meta in list(self._tui_session_meta.items()):
                 if isinstance(meta, dict) and meta.get("session_id") == session_id:
@@ -2455,19 +3153,42 @@ class SkillClawAPIServer:
     # Request handling                                                     #
     # ------------------------------------------------------------------ #
 
-    def _read_cached_system_prompt(self) -> str:
+    def _read_cached_system_prompt(self, source_fingerprint: str = "") -> str:
+        """Return a cached compressed prompt for the *same* source prompt.
+
+        The cache used to be one process-wide file per claw/provider pair, so
+        whichever session arrived first had its compressed instructions written
+        once and then substituted into every later request from every session —
+        including after a restart. The fingerprint ties the cache to the text it
+        was actually derived from.
+        """
         try:
             with open(self._system_prompt_cache_file, "r", encoding="utf-8") as f:
                 data = json.load(f)
             cached = data.get("compressed_system_prompt", "")
-            return cached if isinstance(cached, str) else ""
+            if not isinstance(cached, str) or not cached:
+                return ""
+            cached_source = str(data.get("source_fingerprint") or "")
+            if source_fingerprint and cached_source != source_fingerprint:
+                logger.info(
+                    "[OpenClaw] system prompt cache miss: source prompt differs from cached source"
+                )
+                return ""
+            return cached
         except Exception:
             return ""
 
-    def _write_cached_system_prompt(self, prompt: str):
+    def _write_cached_system_prompt(self, prompt: str, source_fingerprint: str = ""):
         try:
             with open(self._system_prompt_cache_file, "w", encoding="utf-8") as f:
-                json.dump({"compressed_system_prompt": prompt}, f, ensure_ascii=False)
+                json.dump(
+                    {
+                        "compressed_system_prompt": prompt,
+                        "source_fingerprint": source_fingerprint,
+                    },
+                    f,
+                    ensure_ascii=False,
+                )
         except Exception as e:
             logger.warning("[OpenClaw] failed to write system prompt cache: %s", e)
 
@@ -2482,7 +3203,28 @@ class SkillClawAPIServer:
         messages = body.get("messages")
         if not isinstance(messages, list) or not messages:
             raise HTTPException(status_code=400, detail="messages must be a non-empty list")
-        self._touch_session(session_id)
+        # Keep the session out of the idle sweeper's reach for as long as this
+        # request runs, and re-arm the clock when it finishes.
+        with self._in_flight_request(session_id):
+            return await self._handle_request_inner(
+                body,
+                session_id=session_id,
+                turn_type=turn_type,
+                session_done=session_done,
+                protocol=protocol,
+                messages=messages,
+            )
+
+    async def _handle_request_inner(
+        self,
+        body: dict[str, Any],
+        *,
+        session_id: str,
+        turn_type: str,
+        session_done: bool,
+        protocol: str,
+        messages: list,
+    ) -> dict[str, Any]:
         rewritten = 0
         for msg in messages:
             if (
@@ -2503,13 +3245,17 @@ class SkillClawAPIServer:
         # LLM call and the cached OpenClaw prompt can trigger content filters.
         cached_system = ""
         if self._compress_system_prompt:
-            cached_system = self._read_cached_system_prompt()
+            raw_system = ""
+            for m in messages:
+                if isinstance(m, dict) and m.get("role") == "system":
+                    raw_system = _flatten_message_content(m.get("content"))
+                    break
+            # The cache is keyed on the prompt it was derived from, so another
+            # session's (or another project's) instructions can never be
+            # substituted into this request.
+            fingerprint = _system_prompt_fingerprint(raw_system) if raw_system else ""
+            cached_system = self._read_cached_system_prompt(fingerprint)
             if not cached_system:
-                raw_system = ""
-                for m in messages:
-                    if isinstance(m, dict) and m.get("role") == "system":
-                        raw_system = _flatten_message_content(m.get("content"))
-                        break
                 if raw_system:
                     try:
                         cached_system = await asyncio.to_thread(
@@ -2524,7 +3270,7 @@ class SkillClawAPIServer:
                             e,
                         )
                         cached_system = raw_system.strip()
-                    self._write_cached_system_prompt(cached_system)
+                    self._write_cached_system_prompt(cached_system, fingerprint)
 
             if cached_system:
                 for m in messages:
@@ -2577,7 +3323,9 @@ class SkillClawAPIServer:
         forward_body.pop("stream_options", None)
         if "model" not in forward_body:
             forward_body["model"] = self._served_model
-        forward_body["messages"] = messages  # potentially skill-injected
+        # Single choke point: sanitize after skill injection and truncation so
+        # both a client's malformed body and a truncation cut are made valid.
+        forward_body["messages"] = _sanitize_forward_messages(messages)
 
         output = await self._forward_to_llm(forward_body)
         output["model"] = forward_body.get("model") or self._served_model
@@ -2720,7 +3468,9 @@ class SkillClawAPIServer:
             await self._close_session(session_id)
 
         output["session_id"] = session_id
-        return {"response": output}
+        # Report what was actually forwarded so the Responses store can record
+        # the trimmed history rather than re-inflating the full one.
+        return {"response": output, "forwarded_messages": forward_body.get("messages")}
 
     # ------------------------------------------------------------------ #
     # LLM forwarding                                                       #
@@ -2796,6 +3546,20 @@ class SkillClawAPIServer:
         _cap_completion_token_fields(send_body)
         send_body["model"] = self.config.llm_model_id or body.get("model", "")
         send_body["stream"] = stream
+
+        # Native Responses had no truncation, so an over-budget conversation was
+        # forwarded verbatim and rejected upstream. Use the same reserve policy
+        # as the chat path.
+        raw_input = send_body.get("input")
+        if isinstance(raw_input, list) and raw_input:
+            requested_completion = _coerce_int(
+                send_body.get("max_output_tokens", send_body.get("max_completion_tokens")),
+                2048,
+            )
+            reserved = min(requested_completion, max(0, self.config.max_context_tokens - _MIN_PROMPT_TOKENS))
+            max_prompt = self.config.max_context_tokens - reserved
+            if max_prompt > 0:
+                send_body["input"] = _truncate_responses_input(raw_input, max_prompt)
 
         headers = await self._build_upstream_auth_headers(api_base)
         return f"{api_base}/responses", send_body, headers
@@ -2921,20 +3685,28 @@ class SkillClawAPIServer:
                     return resp.json()
             except httpx.HTTPStatusError as e:
                 response_text = e.response.text[:200]
-                if attempt < max_retries - 1:
-                    wait = min(2**attempt + random.uniform(0, 1), 10)
-                    logger.warning(
-                        "[OpenClaw] upstream Responses error (attempt %d/%d), retrying in %.1fs: %s %s",
-                        attempt + 1,
-                        max_retries,
-                        wait,
-                        e.response.status_code,
-                        response_text,
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-                logger.error("[OpenClaw] upstream Responses error: %s %s", e.response.status_code, response_text)
-                raise HTTPException(status_code=502, detail=f"Upstream Responses error: {e}") from e
+                retryable = _is_retryable_status(e.response.status_code)
+                if not retryable or attempt >= max_retries - 1:
+                    logger.error("[OpenClaw] upstream Responses error: %s %s", e.response.status_code, response_text)
+                    if not retryable:
+                        raise HTTPException(
+                            status_code=e.response.status_code,
+                            detail=f"Upstream Responses rejected request: {response_text}",
+                        ) from e
+                    raise HTTPException(status_code=502, detail=f"Upstream Responses error: {e}") from e
+                wait = min(2**attempt + random.uniform(0, 1), 10)
+                if e.response.status_code == 429:
+                    wait = _retry_after_seconds(e.response, wait)
+                logger.warning(
+                    "[OpenClaw] upstream Responses error (attempt %d/%d), retrying in %.1fs: %s %s",
+                    attempt + 1,
+                    max_retries,
+                    wait,
+                    e.response.status_code,
+                    response_text,
+                )
+                await asyncio.sleep(wait)
+                continue
             except Exception as e:
                 if attempt < max_retries - 1:
                     wait = min(2**attempt + random.uniform(0, 1), 10)
@@ -2963,6 +3735,9 @@ class SkillClawAPIServer:
         """Wrap _stream_llm_responses: passthrough SSE + parse response.completed inline."""
         tracked = False
         buf = ""
+        # Incremental UTF-8 decoder: holds a codepoint split across two chunks.
+        decoder = codecs.getincrementaldecoder("utf-8")()
+        flushed = False
         output_items: dict[int, dict[str, Any]] = {}
         output_text_parts: dict[tuple[int, int], str] = {}
 
@@ -3029,38 +3804,58 @@ class SkillClawAPIServer:
                 return response_payload
             return None
 
-        async for chunk in self._stream_llm_responses(body):
-            if not tracked:
-                try:
-                    text = chunk.decode("utf-8", errors="ignore") if isinstance(chunk, bytes) else chunk
-                    buf += text
-                    while "\n" in buf:
-                        line, buf = buf.split("\n", 1)
-                        stripped = line.strip()
-                        if not stripped.startswith("data: "):
-                            continue
-                        raw = stripped[6:]
-                        if raw == "[DONE]":
-                            continue
-                        try:
-                            data = json.loads(raw)
-                        except Exception:
-                            continue
-                        response_payload = parse_responses_stream_event(data) if isinstance(data, dict) else None
-                        if response_payload is not None:
-                            self._record_responses_turn(
-                                session_id,
-                                record_body or body,
-                                response_payload,
-                                turn_type=turn_type,
-                                injected_skills=injected_skills,
-                                session_done=session_done,
-                            )
-                            tracked = True
-                            break
-                except Exception:
-                    pass
-            yield chunk
+        try:
+            async for chunk in self._stream_llm_responses(body):
+                if not tracked:
+                    try:
+                        # Decode a copy for tracking only: the yielded value must
+                        # stay exactly the upstream bytes.
+                        if isinstance(chunk, bytes):
+                            # A codepoint can straddle two upstream chunks;
+                            # decoding each chunk with errors="ignore" dropped
+                            # the partial bytes and corrupted the recorded turn.
+                            text = decoder.decode(chunk)
+                        elif not flushed:
+                            text = decoder.decode(b"", final=True)
+                            flushed = True
+                        else:
+                            text = chunk if isinstance(chunk, str) else ""
+                        buf += text
+                        while "\n" in buf:
+                            line, buf = buf.split("\n", 1)
+                            stripped = line.strip()
+                            if not stripped.startswith("data: ") and not stripped.startswith("data:"):
+                                continue
+                            raw = stripped.split(":", 1)[1].strip()
+                            if raw == "[DONE]":
+                                continue
+                            try:
+                                data = json.loads(raw)
+                            except Exception:
+                                continue
+                            response_payload = parse_responses_stream_event(data) if isinstance(data, dict) else None
+                            if response_payload is not None:
+                                self._record_responses_turn(
+                                    session_id,
+                                    record_body or body,
+                                    response_payload,
+                                    turn_type=turn_type,
+                                    injected_skills=injected_skills,
+                                    session_done=session_done,
+                                )
+                                tracked = True
+                                break
+                    except Exception:
+                        pass
+                yield chunk
+        except Exception as e:
+            # Headers are already on the wire, so a failure here cannot become an
+            # HTTP status. Emit a terminal error event and close the stream
+            # cleanly so the client can tell truncation from success instead of
+            # seeing a dead socket with no terminator.
+            logger.error("[OpenClaw] Responses stream ended early: %s", e)
+            yield _sse_chunk(_stream_error_event(e, model=str(body.get("model") or "")))
+            yield "data: [DONE]\n\n"
 
     async def _stream_llm_responses(self, body: dict[str, Any]):
         """Passthrough upstream Responses SSE without aggregating or rewriting events."""
@@ -3106,6 +3901,43 @@ class SkillClawAPIServer:
                 )
             else:
                 text = str(content or "")
+            if role == "tool":
+                # A tool result is a function_call_output item, not a message.
+                # Emitting it as a message made the upstream see a bare
+                # role:tool turn and the assistant's function_call was never
+                # replayed, so the whole tool round was lost.
+                input_items.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": str(message.get("tool_call_id") or ""),
+                        "output": text or str(content or ""),
+                    }
+                )
+                continue
+            if role == "assistant" and message.get("tool_calls"):
+                # Text first (may be empty), then one function_call per tool.
+                if text:
+                    input_items.append(
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": text}],
+                        }
+                    )
+                for call in message["tool_calls"]:
+                    if not isinstance(call, dict):
+                        continue
+                    raw_function = call.get("function")
+                    function = raw_function if isinstance(raw_function, dict) else {}
+                    input_items.append(
+                        {
+                            "type": "function_call",
+                            "call_id": str(call.get("id") or ""),
+                            "name": str(function.get("name") or ""),
+                            "arguments": str(function.get("arguments") or ""),
+                        }
+                    )
+                continue
             if not text:
                 continue
             if role in {"system", "developer"}:
@@ -3124,6 +3956,11 @@ class SkillClawAPIServer:
         }
         if instructions:
             send_body["instructions"] = "\n\n".join(instructions)
+        # Tools used to be dropped here, so the upstream never learned the
+        # client could call anything and returned text only.
+        tools = body.get("tools")
+        if isinstance(tools, list) and tools:
+            send_body["tools"] = _chat_tools_to_responses(tools)
         # NOTE: deliberately no max_output_tokens / temperature passthrough.
         # The Codex backend rejects both ("Unsupported parameter"), and chat
         # clients routinely set them, so silently dropping is the only way the
@@ -3134,13 +3971,32 @@ class SkillClawAPIServer:
     def _responses_payload_to_chat(payload: dict[str, Any], model: str) -> dict[str, Any]:
         """Render a Responses payload in chat-completions shape for chat clients."""
         text_parts: list[str] = []
+        tool_calls: list[dict[str, Any]] = []
         for item in payload.get("output") or []:
-            if not isinstance(item, dict) or item.get("type") != "message":
+            if not isinstance(item, dict):
                 continue
-            for part in item.get("content") or []:
-                if isinstance(part, dict) and part.get("type") == "output_text":
-                    text_parts.append(str(part.get("text") or ""))
+            if item.get("type") == "message":
+                for part in item.get("content") or []:
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        text_parts.append(str(part.get("text") or ""))
+            elif item.get("type") == "function_call":
+                # Only reading `message` items here discarded every tool call,
+                # so a tool-using chat client got an empty assistant message.
+                call_id = str(item.get("call_id") or item.get("id") or "")
+                tool_calls.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": str(item.get("name") or ""),
+                            "arguments": str(item.get("arguments") or ""),
+                        },
+                    }
+                )
         usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        message: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts)}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
         return {
             "id": payload.get("id", "chatcmpl-skillclaw"),
             "object": "chat.completion",
@@ -3149,8 +4005,10 @@ class SkillClawAPIServer:
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": "".join(text_parts)},
-                    "finish_reason": "stop",
+                    "message": message,
+                    # Report upstream truncation honestly; a hardcoded "stop"
+                    # made a length-capped answer look like a clean finish.
+                    "finish_reason": "tool_calls" if tool_calls else _responses_finish_reason(payload),
                 }
             ],
             "usage": {
@@ -3189,24 +4047,46 @@ class SkillClawAPIServer:
                         )
                     async for line in resp.aiter_lines():
                         stripped = line.strip()
-                        if not stripped.startswith("data: "):
+                        if not stripped.startswith("data:") :
                             continue
-                        raw = stripped[6:]
+                        raw = stripped.split(":", 1)[1].strip()
                         if raw == "[DONE]":
                             break
                         try:
                             event = json.loads(raw)
                         except Exception:
                             continue
+                        if not isinstance(event, dict):
+                            continue
+                        if isinstance(event.get("error"), (dict, str)):
+                            # A mid-stream error frame is a failed generation;
+                            # reporting the partial text as a completion hid
+                            # upstream crashes from the client.
+                            error = event["error"]
+                            message = (
+                                str(error.get("message") or json.dumps(error)[:200])
+                                if isinstance(error, dict)
+                                else str(error)
+                            )
+                            raise _SseStreamError(message)
                         etype = event.get("type")
                         if etype == "response.output_text.delta":
                             text_parts.append(str(event.get("delta") or ""))
+                        elif etype == "response.output_item.done":
+                            item = event.get("item")
+                            # A function_call may arrive only as item events when
+                            # response.completed omits the assembled output.
+                            if isinstance(item, dict) and item.get("type") == "function_call":
+                                _merge_responses_item(final_payload, item)
                         elif etype == "response.completed":
                             candidate = event.get("response")
                             if isinstance(candidate, dict):
                                 final_payload = candidate
         except HTTPException:
             raise
+        except _SseStreamError as e:
+            logger.error("[SkillClaw] chat→responses bridge stream error: %s", e)
+            raise HTTPException(status_code=502, detail=f"Upstream Responses stream error: {e.message}") from e
         except Exception as e:
             logger.error("[SkillClaw] chat→responses bridge failed: %s", e, exc_info=True)
             raise HTTPException(status_code=502, detail=f"Responses bridge error: {e}") from e
@@ -3308,6 +4188,15 @@ class SkillClawAPIServer:
                             events,
                             fallback_model=send_body.get("model", ""),
                         )
+                    except _SseStreamError as stream_error:
+                        # A mid-stream `error` frame is a failed generation, not
+                        # a completion: surface it instead of returning a
+                        # truncated answer as a success.
+                        logger.error("[OpenClaw] upstream SSE stream reported an error: %s", stream_error)
+                        raise HTTPException(
+                            status_code=502,
+                            detail=f"Upstream LLM stream error: {stream_error.message}",
+                        ) from stream_error
                     except httpx.HTTPStatusError as stream_error:
                         logger.error(
                             "[OpenClaw] upstream SSE retry error: %s %s",
@@ -3325,20 +4214,27 @@ class SkillClawAPIServer:
                             detail=f"Upstream LLM SSE retry failed: {stream_error}",
                         ) from stream_error
                 # Retryable upstream error — retry if attempts remain
-                if attempt < max_retries - 1:
-                    wait = min(2**attempt + random.uniform(0, 1), 30)
-                    logger.warning(
-                        "[OpenClaw] upstream LLM error (attempt %d/%d), retrying in %.1fs: %s %s",
-                        attempt + 1,
-                        max_retries,
-                        wait,
-                        e.response.status_code,
-                        response_text,
-                    )
-                    await asyncio.sleep(wait)
-                    continue
-                logger.error("[OpenClaw] upstream LLM error: %s %s", e.response.status_code, response_text)
-                raise HTTPException(status_code=502, detail=f"Upstream LLM error: {e}") from e
+                if not _is_retryable_status(e.response.status_code) or attempt >= max_retries - 1:
+                    logger.error("[OpenClaw] upstream LLM error: %s %s", e.response.status_code, response_text)
+                    if not _is_retryable_status(e.response.status_code):
+                        # A permanent rejection should surface as itself, not as
+                        # a generic gateway error, so the client can act on it.
+                        raise HTTPException(status_code=e.response.status_code,
+                                            detail=f"Upstream LLM rejected request: {response_text}") from e
+                    raise HTTPException(status_code=502, detail=f"Upstream LLM error: {e}") from e
+                wait = min(2**attempt + random.uniform(0, 1), 30)
+                if e.response.status_code == 429:
+                    wait = _retry_after_seconds(e.response, wait)
+                logger.warning(
+                    "[OpenClaw] upstream LLM error (attempt %d/%d), retrying in %.1fs: %s %s",
+                    attempt + 1,
+                    max_retries,
+                    wait,
+                    e.response.status_code,
+                    response_text,
+                )
+                await asyncio.sleep(wait)
+                continue
             except Exception as e:
                 if attempt < max_retries - 1:
                     wait = min(2**attempt + random.uniform(0, 1), 30)
@@ -3559,26 +4455,50 @@ class SkillClawAPIServer:
         tools,
         max_prompt_tokens: int,
     ) -> list[dict]:
-        """Drop oldest non-system messages using a dependency-free token estimate."""
+        """Drop oldest non-system messages until the prompt fits the budget.
 
+        The result is always safe to forward upstream: it keeps the original
+        message order, keeps a ``user`` turn, and never leaves a ``role:tool``
+        result whose issuing assistant turn was dropped.
+        """
+        return self._truncate_messages_to_budget(messages, tools, max_prompt_tokens, [])
+
+    def _truncate_messages_to_budget(
+        self,
+        messages: list[dict],
+        tools,
+        max_prompt_tokens: int,
+        leading_system: list[dict],
+    ) -> list[dict]:
         def _prompt_len(msgs):
             return _estimate_openai_body_input_tokens({"messages": msgs, "tools": tools})
 
-        original_tokens = _prompt_len(messages)
+        original_tokens = _prompt_len(leading_system + messages)
         if original_tokens <= max_prompt_tokens:
-            return messages
+            return list(messages)
 
-        # Split into system and non-system messages. A client can POST a bare
-        # string as a message, so guard the attribute access like every other
-        # helper in this file does.
-        sys_msgs = [m for m in messages if isinstance(m, dict) and m.get("role") == "system"]
-        non_sys = [m for m in messages if isinstance(m, dict) and m.get("role") != "system"]
+        # Partition by role without reordering: hoisting mid-conversation
+        # system messages to the front used to move a system turn ahead of the
+        # user turn it referenced, and left the newest message no longer last.
+        sys_msgs: list[dict] = []
+        non_sys: list[Any] = []
+        for message in messages:
+            # A client can POST a bare string as a message. Dropping such
+            # entries silently changed behaviour based on prompt size, so they
+            # are kept and simply cost tokens.
+            if isinstance(message, dict) and message.get("role") == "system":
+                sys_msgs.append(message)
+            else:
+                non_sys.append(message)
 
         # A role:tool message is only valid when the assistant turn that issued
         # its tool_call_id is still present. Dropping messages one at a time can
         # strip that assistant turn and orphan the result, which OpenAI-compatible
         # upstreams reject with 400 invalid_request_error. Drop whole tool groups.
         units = _message_drop_units(non_sys)
+
+        def fits(candidate: list[Any]) -> bool:
+            return _prompt_len(list(leading_system) + list(sys_msgs) + candidate) <= max_prompt_tokens
 
         # Walk oldest-unit-first and stop as soon as the remainder fits. The
         # newest unit is always kept so the conversation has a live turn.
@@ -3588,10 +4508,24 @@ class SkillClawAPIServer:
             if not candidate:
                 break
             dropped = step
-            if _prompt_len(sys_msgs + candidate) <= max_prompt_tokens:
+            # A conversation with no `user` turn is rejected upstream, so never
+            # settle on a cut that removes every one of them.
+            if _has_user_turn(candidate) and fits(candidate):
                 break
 
-        result = sys_msgs + _drop_oldest_units(non_sys, units, dropped)
+        result = _drop_oldest_units(non_sys, units, dropped)
+        # When even the newest unit is over budget the loop leaves the last
+        # user turn dropped; restoring the newest user unit keeps the request
+        # forwardable at the cost of a few tokens over the soft limit.
+        if not _has_user_turn(result):
+            for step in range(len(units), dropped, -1):
+                candidate = _drop_oldest_units(non_sys, units, step)
+                if candidate and _has_user_turn(candidate):
+                    dropped = step
+                    result = candidate
+                    break
+        result = _repair_orphan_tool_results(result)
+        result = list(leading_system) + list(sys_msgs) + result
         result_tokens = _prompt_len(result)
         if dropped:
             logger.info(
@@ -3722,13 +4656,37 @@ class SkillClawAPIServer:
     # Streaming                                                            #
     # ------------------------------------------------------------------ #
 
+    @staticmethod
+    def _stream_delta_tool_calls(tool_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Re-key a non-streaming ``tool_calls`` list for streaming consumption.
+
+        The chat completion *message* shape omits ``index``; the streaming
+        *delta* shape requires it so a client can attach argument fragments to
+        the right call. Forwarding the message shape verbatim makes the openai
+        SDK raise ``TypeError: list indices must be integers`` mid-stream.
+        """
+        indexed: list[dict[str, Any]] = []
+        for position, call in enumerate(tool_calls):
+            if not isinstance(call, dict):
+                continue
+            if "index" in call:
+                indexed.append(call)
+                continue
+            indexed.append({"index": position, **call})
+        return indexed
+
     async def _stream_response(self, result: dict[str, Any]):
         payload = result["response"]
-        choice = payload.get("choices", [{}])[0]
-        message = choice.get("message", {})
-        delta = {"role": "assistant", "content": message.get("content", "") or ""}
-        if message.get("tool_calls"):
-            delta["tool_calls"] = message["tool_calls"]
+        choices = payload.get("choices") or [{}]
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+        message = choice.get("message") or {}
+        if not isinstance(message, dict):
+            message = {"content": _flatten_message_content(message)}
+        delta: dict[str, Any] = {"role": "assistant", "content": message.get("content", "") or ""}
+        if message.get("reasoning_content"):
+            delta["reasoning_content"] = message["reasoning_content"]
+        if isinstance(message.get("tool_calls"), list) and message["tool_calls"]:
+            delta["tool_calls"] = self._stream_delta_tool_calls(message["tool_calls"])
         chunk_base = {
             "id": payload.get("id", ""),
             "object": "chat.completion.chunk",
@@ -3739,10 +4697,15 @@ class SkillClawAPIServer:
         first = {**chunk_base, "choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
         final = {
             **chunk_base,
-            "choices": [{"index": 0, "delta": {}, "finish_reason": choice.get("finish_reason", "stop")}],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": choice.get("finish_reason") or "stop"}],
         }
-        yield f"data: {json.dumps(first, ensure_ascii=False)}\n\n"
-        yield f"data: {json.dumps(final, ensure_ascii=False)}\n\n"
+        yield _sse_chunk(first)
+        yield _sse_chunk(final)
+        # `stream_options.include_usage` is honoured by emitting the usage-only
+        # chunk the spec defines. It carries no choices and must be last.
+        usage = payload.get("usage")
+        if isinstance(usage, dict) and usage:
+            yield _sse_chunk({**chunk_base, "choices": [], "usage": usage})
         yield "data: [DONE]\n\n"
 
     async def _stream_responses_response(self, response_payload: dict[str, Any]):
