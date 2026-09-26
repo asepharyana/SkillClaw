@@ -132,7 +132,12 @@ class SkillClawLauncher:
                 from .skill_hub import SkillHub
 
                 hub = SkillHub.from_config(cfg)
-                result = hub.pull_skills(cfg.skills_dir)
+                # mirror=False: an unattended startup pull must never rmtree
+                # local skills missing from the remote manifest. That wiped a
+                # 1216-skill library when local_root pointed at a store
+                # holding only evolve's output. Deletion is an explicit
+                # `skillclaw skills pull --mirror` decision.
+                result = hub.pull_skills(cfg.skills_dir, mirror=False)
                 logger.info(
                     "[Launcher] auto-pull: %d downloaded, %d unchanged, %d deleted",
                     result["downloaded"],

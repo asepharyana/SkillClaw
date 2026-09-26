@@ -3512,6 +3512,13 @@ class SkillClawAPIServer:
 
         This is a *read-only* operation — local skills are never pushed
         automatically.  Use ``skillclaw skills push`` for explicit uploads.
+
+        ``mirror=False`` is mandatory here. This runs unattended (session
+        close, the reload poller, the evolve callback), and mirror mode
+        rmtree's every local skill absent from the remote manifest. Pointing
+        ``local_root`` at a store holding only the skills evolve has written
+        would delete the entire local library within seconds. Only an explicit
+        ``skillclaw skills pull --mirror`` may delete.
         """
         try:
             from .skill_hub import SkillHub
@@ -3520,6 +3527,7 @@ class SkillClawAPIServer:
             pull_result = await asyncio.to_thread(
                 hub.pull_skills,
                 self.config.skills_dir,
+                mirror=False,
                 skip_names=skip_names,
             )
             logger.info(

@@ -44,8 +44,8 @@ async def test_skill_pull_runs_storage_sync_in_worker_thread(monkeypatch, tmp_pa
     calls = []
 
     class Hub:
-        def pull_skills(self, skills_dir, *, skip_names=None):
-            calls.append(("pull", skills_dir, skip_names))
+        def pull_skills(self, skills_dir, *, mirror=True, skip_names=None):
+            calls.append(("pull", skills_dir, mirror, skip_names))
             return {
                 "downloaded": 0,
                 "skipped": 1,
@@ -68,4 +68,6 @@ async def test_skill_pull_runs_storage_sync_in_worker_thread(monkeypatch, tmp_pa
 
     await server._pull_skills_from_cloud(skip_names={"local-only"})
     assert calls[0][0] == "to_thread"
-    assert calls[1] == ("pull", str(tmp_path / "skills"), {"local-only"})
+    # mirror must be False: this path runs unattended and mirror mode deletes
+    # local skills absent from the remote manifest.
+    assert calls[1] == ("pull", str(tmp_path / "skills"), False, {"local-only"})

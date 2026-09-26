@@ -829,6 +829,32 @@ class SkillHub:
                 backup_dir="",
             )
 
+        # A backup that is silently incomplete is worse than none: the mirror
+        # step below is about to rmtree every local skill absent from the remote
+        # manifest, and that copytree is the only way back. Verify the backup
+        # actually holds every local skill before permitting any deletion.
+        missing_from_backup = [
+            name
+            for name, skill_path in local_skills.items()
+            if not os.path.isdir(os.path.join(backup_dir, os.path.relpath(skill_path, skills_dir)))
+        ]
+        if missing_from_backup:
+            logger.error(
+                "[SkillHub] backup is incomplete (%d of %d skills absent, e.g. %s); refusing to mirror-delete",
+                len(missing_from_backup),
+                len(local_skills),
+                ", ".join(sorted(missing_from_backup)[:3]),
+            )
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            return _result(
+                downloaded=0,
+                skipped=0,
+                deleted=0,
+                total_remote=len(manifest),
+                restored_from_backup=False,
+                backup_dir="",
+            )
+
         os.makedirs(staging_dir, exist_ok=True)
         resolved_targets: dict[str, str] = {}
 
@@ -873,7 +899,10 @@ class SkillHub:
                 # каталог мог уйти вместе с родительским скиллом — это не повод откатывать весь pull
                 if not os.path.isdir(stale_dir):
                     continue
-                shutil.rmtree(stale_dir, ignore_errors=True)
+                # ignore_errors=True would hide a failed delete and report it as
+                # success, so a half-removed library looks clean. Surface it.
+                shutil.rmtree(stale_dir)
+                logger.info("[SkillHub] removed stale local skill not in remote manifest: %s", stale)
                 deleted += 1
 
             for name in sorted(remote_names):
