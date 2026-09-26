@@ -48,8 +48,19 @@ def _pull_lock(skills_dir: str):
 
     Отдаёт False, если pull уже идёт где-то ещё, — цикл просто пропускается.
     """
-    lock_path = os.path.join(os.path.dirname(os.path.abspath(skills_dir)), ".skillclaw_pull.lock")
-    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    skills_dir = os.path.abspath(skills_dir)
+    lock_dir = os.path.dirname(skills_dir)
+    lock_path = os.path.join(lock_dir, ".skillclaw_pull.lock")
+    try:
+        # skills_dir may not exist yet (first pull into a fresh root), and the
+        # lock must not be the thing that creates the tree it is meant to guard.
+        os.makedirs(lock_dir, exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        # Unwritable parent: fall back to running unlocked rather than failing
+        # the pull outright. Concurrent pulls degrade to the pre-lock behavior.
+        yield True
+        return
     try:
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
