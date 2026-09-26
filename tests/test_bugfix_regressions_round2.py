@@ -747,3 +747,25 @@ def test_empty_library_yields_empty_prompt(tmp_path) -> None:
     empty = tmp_path / "none"
     empty.mkdir()
     assert SkillManager(skills_dir=str(empty)).build_injection_prompt() == ""
+
+
+# --------------------------------------------------------------------------- #
+# config_store: max_skills_prompt_chars must actually be wired through           #
+# --------------------------------------------------------------------------- #
+
+
+def test_max_skills_prompt_chars_is_mapped(tmp_path) -> None:
+    """It existed on SkillClawConfig and was read via getattr, but nothing
+    ever wrote it from the config file, so a configured value was silently
+    ignored and the 30000 default applied."""
+    path = tmp_path / "c.yaml"
+    path.write_text("max_skills_prompt_chars: 900000\nmax_context_tokens: 400000\n", encoding="utf-8")
+    cfg = ConfigStore(config_file=path).to_skillclaw_config()
+    assert cfg.max_skills_prompt_chars == 900_000
+    assert cfg.max_context_tokens == 400_000
+
+
+def test_max_skills_prompt_chars_defaults_when_absent(tmp_path) -> None:
+    path = tmp_path / "c.yaml"
+    path.write_text("proxy:\n  port: 30000\n", encoding="utf-8")
+    assert ConfigStore(config_file=path).to_skillclaw_config().max_skills_prompt_chars == 30000

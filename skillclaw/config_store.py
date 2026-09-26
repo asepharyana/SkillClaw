@@ -485,6 +485,10 @@ class ConfigStore:
                 skills.get("embedding_api_key") or embedding.get("api_key") or ""
             ).strip(),
             max_context_tokens=_as_int(data.get("max_context_tokens"), 20000),
+            # Was never mapped, so a configured value was silently ignored and
+            # the 30000 default applied — which is what forced the catalog
+            # into its compact, truncated form.
+            max_skills_prompt_chars=_as_int(data.get("max_skills_prompt_chars"), 30000),
             # PRM
             use_prm=bool(prm.get("enabled", True)),
             prm_provider=prm_provider,
