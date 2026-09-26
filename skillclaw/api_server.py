@@ -1704,6 +1704,26 @@ def _message_tool_call_ids(message: dict) -> set[str]:
     return ids
 
 
+def _issued_tool_call_ids(message: dict) -> set[str]:
+    """Tool_call ids a message ISSUES, ignoring ids it merely answers.
+
+    ``_message_tool_call_ids`` also counts a ``role:tool`` message's own
+    ``tool_call_id``, which is what truncation grouping wants but the opposite
+    of what orphan detection wants: a result counted as its own issuer can
+    never be recognised as unissued.
+    """
+    if not isinstance(message, dict) or message.get("role") == "tool":
+        return set()
+
+    ids: set[str] = set()
+    tool_calls = message.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for call in tool_calls:
+            if isinstance(call, dict) and call.get("id"):
+                ids.add(str(call["id"]))
+    return ids
+
+
 def _message_drop_units(messages: list[dict]) -> list[list[int]]:
     """Group message indices into units that must be dropped together.
 
@@ -1990,8 +2010,7 @@ def _sanitize_forward_messages(messages: list[Any]) -> list[Any]:
     # 1. Drop tool results with no id or no issuer anywhere in the request.
     issued: set[str] = set()
     for message in messages:
-        if isinstance(message, dict):
-            issued |= _message_tool_call_ids(message)
+        issued |= _issued_tool_call_ids(message)
 
     kept: list[Any] = []
     dropped_orphans = 0
@@ -2041,25 +2060,51 @@ def _sanitize_forward_messages(messages: list[Any]) -> list[Any]:
     return kept
 
 
+def _pending_tool_call_ids(message: Any) -> list[str]:
+    """Tool-call ids issued by an assistant message, in emission order."""
+    if not isinstance(message, dict) or message.get("role") != "assistant":
+        return []
+    ids: list[str] = []
+    for call in message.get("tool_calls") or []:
+        if isinstance(call, dict):
+            call_id = str(call.get("id") or "").strip()
+            if call_id:
+                ids.append(call_id)
+    return ids
+
+
 def _hoist_tool_results_after_assistant(messages: list[Any]) -> list[Any]:
-    """Move each ``role:tool`` message directly after its issuing assistant."""
+    """Move each ``role:tool`` message directly after its issuing assistant.
+
+    A result is misplaced only when it precedes the turn that issued it. The
+    common case -- result already following its issuer -- is kept verbatim, so
+    the reordering must never be able to drop one.
+    """
+    issuer_pos: dict[str, int] = {}
+    for index, message in enumerate(messages):
+        for call_id in _pending_tool_call_ids(message):
+            issuer_pos.setdefault(call_id, index)
+
     out: list[Any] = []
-    pending: dict[str, list[Any]] = {}
-    for message in messages:
+    # Results held back until their issuer has been emitted, each tagged with
+    # that issuer's position.
+    held: list[tuple[int, Any]] = []
+
+    for index, message in enumerate(messages):
         if isinstance(message, dict) and message.get("role") == "tool":
             call_id = str(message.get("tool_call_id") or "").strip()
-            pending.setdefault(call_id, []).append(message)
+            held.append((issuer_pos.get(call_id, len(messages)), message))
             continue
+        # Results whose issuer is already behind us can go out now.
+        out.extend(message for _, message in held if _ < index)
+        held = [(pos, msg) for pos, msg in held if pos >= index]
         out.append(message)
-        if isinstance(message, dict) and message.get("role") == "assistant":
-            for call in message.get("tool_calls") or []:
-                if not isinstance(call, dict):
-                    continue
-                call_id = str(call.get("id") or "").strip()
-                waiting = pending.pop(call_id, None)
-                if waiting:
-                    out.extend(waiting)
-    # Anything still waiting had no issuer; drop it rather than reorder blindly.
+        # ...and the ones this very message issues follow it immediately.
+        out.extend(msg for pos, msg in held if pos == index)
+        held = [(pos, msg) for pos, msg in held if pos != index]
+
+    # A result with no issuer anywhere keeps its place rather than vanishing.
+    out.extend(message for _, message in held)
     return out
 
 
@@ -2074,8 +2119,7 @@ def _repair_orphan_tool_results(messages: list[dict]) -> list[dict]:
     """
     issued: set[str] = set()
     for message in messages:
-        if isinstance(message, dict):
-            issued |= _message_tool_call_ids(message)
+        issued |= _issued_tool_call_ids(message)
     repaired: list[dict] = []
     for message in messages:
         if isinstance(message, dict) and message.get("role") == "tool":
