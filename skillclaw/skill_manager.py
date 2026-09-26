@@ -704,11 +704,18 @@ class SkillManager:
         max_chars: int = 30_000,
         read_tool_name: str = "read",
     ) -> str:
-        """One-call helper: catalog all skills and wrap with instructions.
+        """One-call helper: catalog skills and wrap with instructions.
 
         Uses the full format (name + description + location) when the catalog
         fits within *max_chars*; falls back to compact format (name + location)
-        otherwise.  Returns the empty string when no skills are loaded.
+        otherwise, and then truncates the entry list so the prompt never
+        exceeds the budget.  Returns the empty string when no skills are loaded.
+
+        Truncation matters: a large library (the order of a thousand skills)
+        produced a ~170k-character catalog even at max_chars=30_000, because
+        the argument previously only selected the format. That catalog
+        outgrew max_context_tokens and pushed the user's actual conversation
+        out of the forwarded prompt, which looks exactly like context loss.
         """
         skills = self.get_all_skills()
         if not skills:
@@ -718,7 +725,25 @@ class SkillManager:
             catalog = full_prompt
         else:
             catalog = self.format_skills_compact(skills)
+            if len(catalog) > max_chars:
+                catalog = self._truncate_catalog(skills, max_chars)
         return self.build_skills_section(catalog, read_tool_name)
+
+    def _truncate_catalog(self, skills: list[dict], max_chars: int) -> str:
+        """Fit as many compact skill entries as possible into *max_chars*."""
+        lines: list[str] = []
+        used = 0
+        for skill in skills:
+            entry = self.format_skills_compact([skill])
+            # +1 for the newline this entry will occupy.
+            if used + len(entry) + 1 > max_chars:
+                break
+            lines.append(entry)
+            used += len(entry) + 1
+        omitted = len(skills) - len(lines)
+        if omitted > 0:
+            lines.append(f"<!-- {omitted} further skills omitted to fit the context budget -->")
+        return "\n".join(lines)
 
     def _remove_skill_from_memory(self, name: str) -> None:
         """Remove a skill from in-memory structures (not from disk)."""

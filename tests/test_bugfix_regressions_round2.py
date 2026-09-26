@@ -687,3 +687,63 @@ def test_validation_worker_preserves_zero_temperature() -> None:
     source = inspect.getsource(validation_worker)
     assert 'or 0.1)' not in source
     assert 'getattr(config, "prm_temperature", 0.6)' in source
+
+
+# --------------------------------------------------------------------------- #
+# skill_manager: the catalog must actually honour max_chars                       #
+# --------------------------------------------------------------------------- #
+
+
+def _catalog_manager(tmp_path, n_skills: int):
+    from skillclaw.skill_manager import SkillManager
+
+    root = tmp_path / "skills"
+    for i in range(n_skills):
+        d = root / f"skill-{i:04d}"
+        d.mkdir(parents=True)
+        (d / "SKILL.md").write_text(
+            f"---\nname: skill-{i:04d}\ndescription: A reasonably long description for skill {i}.\n---\n\n"
+            + "body " * 40,
+            encoding="utf-8",
+        )
+    return SkillManager(skills_dir=str(root))
+
+
+def test_injection_prompt_respects_max_chars(tmp_path) -> None:
+    """max_chars only selected the format before; a large library produced a
+    ~170k-char catalog that outgrew max_context_tokens and pushed the user's
+    conversation out of the forwarded prompt.
+    """
+    manager = _catalog_manager(tmp_path, 300)
+    for max_chars in (4_000, 8_000, 30_000):
+        prompt = manager.build_injection_prompt(max_chars=max_chars)
+        # build_skills_section adds a fixed header/footer around the catalog.
+        assert len(prompt) <= max_chars + 2_000, f"max_chars={max_chars} produced {len(prompt)} chars"
+
+
+def test_injection_prompt_scales_with_budget(tmp_path) -> None:
+    manager = _catalog_manager(tmp_path, 300)
+    small = len(manager.build_injection_prompt(max_chars=4_000))
+    large = len(manager.build_injection_prompt(max_chars=30_000))
+    assert small < large, "a larger budget should fit more of the catalog"
+
+
+def test_injection_prompt_still_lists_skills_within_budget(tmp_path) -> None:
+    manager = _catalog_manager(tmp_path, 20)
+    prompt = manager.build_injection_prompt(max_chars=30_000)
+    assert "skill-0000" in prompt
+    assert "skill-0019" in prompt
+
+
+def test_truncated_catalog_reports_omissions(tmp_path) -> None:
+    manager = _catalog_manager(tmp_path, 300)
+    prompt = manager.build_injection_prompt(max_chars=4_000)
+    assert "omitted to fit the context budget" in prompt
+
+
+def test_empty_library_yields_empty_prompt(tmp_path) -> None:
+    from skillclaw.skill_manager import SkillManager
+
+    empty = tmp_path / "none"
+    empty.mkdir()
+    assert SkillManager(skills_dir=str(empty)).build_injection_prompt() == ""
