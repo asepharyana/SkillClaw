@@ -54,6 +54,10 @@ _NON_STANDARD_BODY_KEYS = {
     "reasoning_effort",
 }
 _OPENAI_COMPAT_MAX_COMPLETION_TOKENS = 8192
+# Floor for the prompt budget. Whatever completion size a client asks for,
+# always keep at least this many estimated tokens of conversation so
+# truncation stays active instead of being skipped by an oversized max_tokens.
+_MIN_PROMPT_TOKENS = 1024
 _PROTOCOL_ANTHROPIC_MESSAGES = "anthropic_messages"
 _PROTOCOL_RESPONSES_COMPAT = "responses_compat"
 
@@ -2560,8 +2564,12 @@ class SkillClawAPIServer:
             2048,
         )
 
-        # Truncate to fit within max_context_tokens (keep system + most-recent messages)
-        max_prompt = self.config.max_context_tokens - requested_completion
+        # Truncate to fit within max_context_tokens (keep system + most-recent
+        # messages). Reserve room for the completion, but never let a large
+        # client max_tokens drive the prompt budget to zero: that silently
+        # disabled truncation and forwarded an over-limit prompt upstream.
+        reserved = min(requested_completion, max(0, self.config.max_context_tokens - _MIN_PROMPT_TOKENS))
+        max_prompt = self.config.max_context_tokens - reserved
         if max_prompt > 0:
             messages = self._truncate_messages(messages, tools, max_prompt)
 
@@ -2663,7 +2671,9 @@ class SkillClawAPIServer:
             self._turn_counts[session_id] = self._turn_counts.get(session_id, 0) + 1
             turn_num = self._turn_counts[session_id]
             prompt_text = "\n".join(
-                f"{m.get('role', '?')}: {_flatten_message_content(m.get('content', ''))}" for m in messages
+                f"{m.get('role', '?')}: {_flatten_message_content(m.get('content', ''))}"
+                for m in messages
+                if isinstance(m, dict)
             )
             response_text = content or (json.dumps(tool_calls, ensure_ascii=False) if tool_calls else "")
             self._buffer_record(session_id, turn_num, messages, prompt_text, response_text, tool_calls)
