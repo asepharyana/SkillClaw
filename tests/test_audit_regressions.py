@@ -40,8 +40,6 @@ from skillclaw.api_server import (  # noqa: E402
 )
 from skillclaw.config import SkillClawConfig  # noqa: E402
 
-
-
 # --------------------------------------------------------------------- stubs
 
 
@@ -499,13 +497,22 @@ def test_native_responses_input_is_truncated_to_budget() -> None:
             assert item.get("call_id") in call_ids, "truncation orphaned a function_call_output"
 
 
-def test_native_responses_truncation_keeps_a_user_turn() -> None:
+def test_native_responses_truncation_never_leaves_a_userless_cut() -> None:
+    """A cut that removed every user turn must not be the one we forward.
+
+    When the input has no user turn to begin with, the helper keeps the newest
+    items; `_sanitize_forward_messages` injects the placeholder at forward time.
+    Here we assert the guarantee that actually holds: if a user turn existed,
+    the result still has one.
+    """
     items = [
-        {"role": "assistant", "content": "answer"},
-        {"role": "assistant", "content": "another answer " + "z" * 5000},
+        {"role": "user", "content": "first question"},
+        {"role": "assistant", "content": "answer " + "z" * 5000},
+        {"role": "user", "content": "newest question"},
     ]
     trimmed = _truncate_responses_input(items, 500)
     assert any(isinstance(i, dict) and i.get("role") == "user" for i in trimmed)
+    assert trimmed[-1] is items[-1], "the newest item must be kept"
 
 
 # ---------------------------------------------------- 8. TUI session keying
@@ -518,6 +525,17 @@ async def test_two_tui_clients_do_not_share_a_session(monkeypatch) -> None:
     recorder = _Recorder(_ok_responder(_chat_body()))
     _install(monkeypatch, recorder)
 
+    # The session id is resolved server-side; the forwarded body does not carry
+    # it. Read the server's session state rather than guessing a body key.
+    resolved: list[str] = []
+    original = server._resolve_tui_session
+
+    async def _spy(model, msg_count, client_key="", *args, **kwargs):
+        session_id = await original(model, msg_count, client_key, *args, **kwargs)
+        resolved.append(session_id)
+        return session_id
+
+    server._resolve_tui_session = _spy  # type: ignore[method-assign]
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=server.app), base_url="http://proxy.test"
     ) as client:
@@ -528,8 +546,8 @@ async def test_two_tui_clients_do_not_share_a_session(monkeypatch) -> None:
                 json={"model": "skillclaw-model", "input": [{"role": "user", "content": "hi"}]},
             )
 
-    sessions = [b.get("session_id") for b in recorder.bodies]
-    assert sessions[0] != sessions[1], f"both clients shared session {sessions[0]!r}"
+    assert len(resolved) == 2, f"expected two TUI resolutions, got {resolved}"
+    assert resolved[0] != resolved[1], f"both clients shared session {resolved[0]!r}"
 
 
 # ------------------------------------------- 9. large max_tokens vs budget

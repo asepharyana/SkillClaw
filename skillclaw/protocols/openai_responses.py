@@ -38,6 +38,26 @@ def _usage_total(usage: dict[str, Any]) -> int:
     )
 
 
+def _chat_usage_to_responses(chat_usage: dict[str, Any]) -> dict[str, Any]:
+    """Render chat ``usage`` in the Responses spelling, details preserved.
+
+    The counts are renamed, not discarded, and a missing total is derived so a
+    client counting context progress never sees an unexplained zero.
+    """
+    out: dict[str, Any] = {
+        "input_tokens": _usage_count(chat_usage, "prompt_tokens", "input_tokens"),
+        "output_tokens": _usage_count(chat_usage, "completion_tokens", "output_tokens"),
+        "total_tokens": _usage_total(chat_usage),
+    }
+    prompt_details = chat_usage.get("prompt_tokens_details")
+    completion_details = chat_usage.get("completion_tokens_details")
+    if isinstance(prompt_details, dict):
+        out["input_tokens_details"] = dict(prompt_details)
+    if isinstance(completion_details, dict):
+        out["output_tokens_details"] = dict(completion_details)
+    return out
+
+
 def _in_progress_item(item: dict[str, Any]) -> dict[str, Any]:
     """Strip a finished output item down to its in-progress shape.
 
@@ -316,6 +336,24 @@ def from_openai_chat_payload(payload: dict[str, Any], model: str) -> dict[str, A
         )
 
     usage = payload.get("usage", {})
+    # Carry the detail sub-objects across. Rebuilding usage from three scalars
+    # dropped cached_tokens and reasoning_tokens, so a client's token-progress
+    # counter read 0 for a request that really did use a large cached prefix.
+    chat_usage: dict[str, Any] = {
+        "prompt_tokens": _usage_count(usage, "prompt_tokens", "input_tokens"),
+        "completion_tokens": _usage_count(usage, "completion_tokens", "output_tokens"),
+        "total_tokens": _usage_total(usage),
+    }
+    for source_key, target_key in (
+        ("prompt_tokens_details", "prompt_tokens_details"),
+        ("input_tokens_details", "prompt_tokens_details"),
+        ("completion_tokens_details", "completion_tokens_details"),
+        ("output_tokens_details", "completion_tokens_details"),
+    ):
+        detail = usage.get(source_key)
+        if isinstance(detail, dict) and target_key not in chat_usage:
+            chat_usage[target_key] = dict(detail)
+
     response_payload = {
         "id": payload.get("id") or f"resp_skillclaw_{int(time.time() * 1000)}",
         "object": "response",
@@ -326,11 +364,7 @@ def from_openai_chat_payload(payload: dict[str, Any], model: str) -> dict[str, A
         "parallel_tool_calls": True,
         "tool_choice": "auto",
         "tools": [],
-        "usage": {
-            "input_tokens": _usage_count(usage, "prompt_tokens", "input_tokens"),
-            "output_tokens": _usage_count(usage, "completion_tokens", "output_tokens"),
-            "total_tokens": _usage_total(usage),
-        },
+        "usage": _chat_usage_to_responses(chat_usage),
     }
     if content_text:
         response_payload["output_text"] = content_text

@@ -1762,6 +1762,43 @@ def _merge_responses_item(payload: dict[str, Any], item: dict[str, Any]) -> None
     output.append(item)
 
 
+def _responses_usage_to_chat(usage: dict[str, Any]) -> dict[str, Any]:
+    """Translate Responses ``usage`` into chat ``usage``, details included.
+
+    Rebuilding the dict from three scalars silently dropped
+    ``input_tokens_details``/``output_tokens_details``, so a client rendering a
+    cache or reasoning progress counter read 0 even though the upstream
+    reported real numbers. Rename the keys, keep every sub-object, and derive
+    ``total_tokens`` when the upstream omits it.
+    """
+    prompt_details = usage.get("input_tokens_details")
+    completion_details = usage.get("output_tokens_details")
+    chat: dict[str, Any] = {
+        "prompt_tokens": _usage_int(usage, "input_tokens", "prompt_tokens"),
+        "completion_tokens": _usage_int(usage, "output_tokens", "completion_tokens"),
+        "total_tokens": _usage_int(usage, "total_tokens"),
+    }
+    if chat["total_tokens"] <= 0:
+        chat["total_tokens"] = chat["prompt_tokens"] + chat["completion_tokens"]
+    if isinstance(prompt_details, dict):
+        chat["prompt_tokens_details"] = dict(prompt_details)
+    if isinstance(completion_details, dict):
+        chat["completion_tokens_details"] = dict(completion_details)
+    return chat
+
+
+def _usage_int(usage: dict[str, Any], *keys: str) -> int:
+    for key in keys:
+        value = usage.get(key)
+        if value is None:
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
 def _responses_finish_reason(payload: dict[str, Any]) -> str:
     """Map a Responses terminal status onto a chat ``finish_reason``."""
     if str(payload.get("status") or "") == "incomplete":
@@ -2298,6 +2335,7 @@ class SkillClawAPIServer:
                 session_id = _raw_sid or await owner._resolve_tui_session(
                     body.get("model", owner._served_model),
                     len(body.get("input", []) if isinstance(body.get("input"), list) else []),
+                    owner._tui_client_key(request, authorization),
                 )
                 session_done = _resolve_session_done(x_session_done, body.get("session_done"))
                 if bool(body.get("stream", False)):
@@ -2474,7 +2512,11 @@ class SkillClawAPIServer:
                 turn_type = _resolve_turn_type(x_turn_type, raw_body.get("turn_type"), default="main")
             else:
                 msg_count = len(openai_body.get("messages") or [])
-                session_id = await owner._resolve_tui_session(model, msg_count)
+                session_id = await owner._resolve_tui_session(
+                    model,
+                    msg_count,
+                    owner._tui_client_key(request, authorization),
+                )
                 turn_type = _resolve_turn_type(x_turn_type, raw_body.get("turn_type"), default="main")
             session_done = _resolve_session_done(x_session_done, raw_body.get("session_done"))
 
@@ -3993,7 +4035,8 @@ class SkillClawAPIServer:
                         },
                     }
                 )
-        usage = payload.get("usage") if isinstance(payload.get("usage"), dict) else {}
+        usage = payload.get("usage")
+        usage_dict: dict[str, Any] = usage if isinstance(usage, dict) else {}
         message: dict[str, Any] = {"role": "assistant", "content": "".join(text_parts)}
         if tool_calls:
             message["tool_calls"] = tool_calls
@@ -4011,11 +4054,7 @@ class SkillClawAPIServer:
                     "finish_reason": "tool_calls" if tool_calls else _responses_finish_reason(payload),
                 }
             ],
-            "usage": {
-                "prompt_tokens": usage.get("input_tokens", 0),
-                "completion_tokens": usage.get("output_tokens", 0),
-                "total_tokens": usage.get("total_tokens", 0),
-            },
+            "usage": _responses_usage_to_chat(usage_dict),
         }
 
     async def _forward_chat_via_responses(self, body: dict[str, Any]) -> dict[str, Any]:
@@ -4045,43 +4084,68 @@ class SkillClawAPIServer:
                         raise HTTPException(
                             status_code=502, detail=f"Upstream Responses error {resp.status_code}: {detail}"
                         )
-                    async for line in resp.aiter_lines():
-                        stripped = line.strip()
-                        if not stripped.startswith("data:") :
-                            continue
-                        raw = stripped.split(":", 1)[1].strip()
-                        if raw == "[DONE]":
-                            break
+                    content_type = (resp.headers.get("content-type") or "").lower()
+                    if "text/event-stream" not in content_type:
+                        # The bridge asks for stream=true, but a buffering
+                        # gateway or a non-conforming upstream can still answer
+                        # with a plain JSON body. Parsing that as SSE yielded an
+                        # empty message and all-zero usage, so read it directly.
+                        raw_body = (await resp.aread()).decode("utf-8", "ignore")
                         try:
-                            event = json.loads(raw)
-                        except Exception:
-                            continue
-                        if not isinstance(event, dict):
-                            continue
-                        if isinstance(event.get("error"), (dict, str)):
-                            # A mid-stream error frame is a failed generation;
-                            # reporting the partial text as a completion hid
-                            # upstream crashes from the client.
-                            error = event["error"]
+                            payload = json.loads(raw_body)
+                        except Exception as parse_error:
+                            raise _SseStreamError(
+                                f"upstream returned {content_type or 'an unknown content type'}: {parse_error}"
+                            ) from parse_error
+                        if not isinstance(payload, dict):
+                            raise _SseStreamError("upstream returned a non-object JSON body")
+                        if isinstance(payload.get("error"), (dict, str)):
+                            error = payload["error"]
                             message = (
                                 str(error.get("message") or json.dumps(error)[:200])
                                 if isinstance(error, dict)
                                 else str(error)
                             )
                             raise _SseStreamError(message)
-                        etype = event.get("type")
-                        if etype == "response.output_text.delta":
-                            text_parts.append(str(event.get("delta") or ""))
-                        elif etype == "response.output_item.done":
-                            item = event.get("item")
-                            # A function_call may arrive only as item events when
-                            # response.completed omits the assembled output.
-                            if isinstance(item, dict) and item.get("type") == "function_call":
-                                _merge_responses_item(final_payload, item)
-                        elif etype == "response.completed":
-                            candidate = event.get("response")
-                            if isinstance(candidate, dict):
-                                final_payload = candidate
+                        final_payload = payload
+                    else:
+                        async for line in resp.aiter_lines():
+                            stripped = line.strip()
+                            if not stripped.startswith("data:"):
+                                continue
+                            raw = stripped.split(":", 1)[1].strip()
+                            if raw == "[DONE]":
+                                break
+                            try:
+                                event = json.loads(raw)
+                            except Exception:
+                                continue
+                            if not isinstance(event, dict):
+                                continue
+                            if isinstance(event.get("error"), (dict, str)):
+                                # A mid-stream error frame is a failed generation;
+                                # reporting the partial text as a completion hid
+                                # upstream crashes from the client.
+                                error = event["error"]
+                                message = (
+                                    str(error.get("message") or json.dumps(error)[:200])
+                                    if isinstance(error, dict)
+                                    else str(error)
+                                )
+                                raise _SseStreamError(message)
+                            etype = event.get("type")
+                            if etype == "response.output_text.delta":
+                                text_parts.append(str(event.get("delta") or ""))
+                            elif etype == "response.output_item.done":
+                                item = event.get("item")
+                                # A function_call may arrive only as item events when
+                                # response.completed omits the assembled output.
+                                if isinstance(item, dict) and item.get("type") == "function_call":
+                                    _merge_responses_item(final_payload, item)
+                            elif etype == "response.completed":
+                                candidate = event.get("response")
+                                if isinstance(candidate, dict):
+                                    final_payload = candidate
         except HTTPException:
             raise
         except _SseStreamError as e:
